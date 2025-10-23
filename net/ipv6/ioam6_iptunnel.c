@@ -106,6 +106,21 @@ static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 	return true;
 }
 
+static struct ioam6_trace_gob_hdr *
+ioam6_lwt_trace_gob_hdr(struct ioam6_lwt_encap *tuninfo)
+{
+	struct ioam6_trace_hdr *traceh = &tuninfo->traceh;
+	void *tail;
+
+	if (!traceh->type.gob)
+		/* GOB is not configured */
+		return NULL;
+
+	tail = (void *)traceh->data + traceh->remlen * 4;
+
+	return (struct ioam6_trace_gob_hdr *)tail;
+}
+
 static int ioam6_build_state(struct net *net, struct nlattr *nla,
 			     unsigned int family, const void *cfg,
 			     struct lwtunnel_state **ts,
@@ -535,6 +550,7 @@ static int ioam6_fill_encap_info(struct sk_buff *skb,
 				 struct lwtunnel_state *lwtstate)
 {
 	struct ioam6_lwt *ilwt = ioam6_lwt_state(lwtstate);
+	struct ioam6_trace_gob_hdr *gobh;
 	int err;
 
 	err = nla_put_u32(skb, IOAM6_IPTUNNEL_FREQ_K, ilwt->freq.k);
@@ -564,6 +580,16 @@ static int ioam6_fill_encap_info(struct sk_buff *skb,
 
 	err = nla_put(skb, IOAM6_IPTUNNEL_TRACE, sizeof(ilwt->tuninfo.traceh),
 		      &ilwt->tuninfo.traceh);
+	if (err)
+		goto ret;
+
+	/* Global-Unique trace block is set */
+	gobh = ioam6_lwt_trace_gob_hdr(&ilwt->tuninfo);
+	if (!gobh)
+		return 0;
+
+	err = nla_put(skb, IOAM6_IPTUNNEL_TRACE_GOB, sizeof(*gobh), gobh);
+
 ret:
 	return err;
 }
@@ -571,12 +597,20 @@ ret:
 static int ioam6_encap_nlsize(struct lwtunnel_state *lwtstate)
 {
 	struct ioam6_lwt *ilwt = ioam6_lwt_state(lwtstate);
+	struct ioam6_trace_gob_hdr *gob;
 	int nlsize;
 
 	nlsize = nla_total_size(sizeof(ilwt->freq.k)) +
 		  nla_total_size(sizeof(ilwt->freq.n)) +
 		  nla_total_size(sizeof(ilwt->mode)) +
 		  nla_total_size(sizeof(ilwt->tuninfo.traceh));
+
+	/*XXX: why does the original code doesn't consier the variable length
+	 * of the trace data? Probably because the userspace doesn't need to
+	 * show the trace data?
+	 */
+	gob = ioam6_lwt_trace_gob_hdr(&ilwt->tuninfo);
+	nlsize += gob ? sizeof(*gob) : 0;
 
 	if (ilwt->mode != IOAM6_IPTUNNEL_MODE_INLINE) {
 		if (ilwt->has_tunsrc)
