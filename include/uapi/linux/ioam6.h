@@ -76,7 +76,9 @@ struct ioam6_trace_hdr {
 				bit18:1,	/* unused */
 				bit17:1,	/* unused */
 				bit16:1,	/* unused */
-				:8;		/* reserved */
+				gob:1,
+				gobver:2,
+				:5;		/* reserved */
 		} type;
 	};
 
@@ -118,7 +120,9 @@ struct ioam6_trace_hdr {
 				bit21:1,	/* unused */
 				bit22:1,
 				bit23:1,	/* reserved */
-				:8;		/* reserved */
+				:5,		/* reserved */
+				gobver:2,
+				gob:1;
 		} type;
 	};
 
@@ -128,6 +132,12 @@ struct ioam6_trace_hdr {
 
 #define IOAM6_TRACE_DATA_SIZE_MAX 244
 	__u8	data[];
+} __attribute__((packed));
+
+struct ioam6_trace_gob_hdr {
+	__be32 hdr;
+#define IOAM6_TRACE_GOB_DATA_SIZE_MAX 252
+	__u8 data[];
 } __attribute__((packed));
 
 #endif /* _UAPI_LINUX_IOAM6_H */

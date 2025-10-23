@@ -79,6 +79,8 @@ static const struct nla_policy ioam6_iptunnel_policy[IOAM6_IPTUNNEL_MAX + 1] = {
 	[IOAM6_IPTUNNEL_DST]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
 	[IOAM6_IPTUNNEL_TRACE]	= NLA_POLICY_EXACT_LEN(
 					sizeof(struct ioam6_trace_hdr)),
+	[IOAM6_IPTUNNEL_TRACE_GOB] = NLA_POLICY_EXACT_LEN(
+					sizeof(struct ioam6_trace_gob_hdr)),
 };
 
 static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
@@ -110,12 +112,17 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 			     struct netlink_ext_ack *extack)
 {
 	struct nlattr *tb[IOAM6_IPTUNNEL_MAX + 1];
+	struct ioam6_trace_gob_hdr *gob_hdr;
 	struct ioam6_lwt_encap *tuninfo;
 	struct ioam6_trace_hdr *trace;
 	struct lwtunnel_state *lwt;
 	struct ioam6_lwt *ilwt;
 	int len_aligned, err;
 	u32 freq_k, freq_n;
+	int gob_len = 0;
+	int len_trace;
+	int total_len;
+	u8 *tail;
 	u8 mode;
 
 	if (family != AF_INET6)
@@ -162,13 +169,42 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 	}
 
 	trace = nla_data(tb[IOAM6_IPTUNNEL_TRACE]);
+
 	if (!ioam6_validate_trace_hdr(trace)) {
 		NL_SET_ERR_MSG_ATTR(extack, tb[IOAM6_IPTUNNEL_TRACE],
 				    "invalid trace validation");
 		return -EINVAL;
 	}
 
-	len_aligned = ALIGN(trace->remlen * 4, 8);
+	if (trace->type.gob) {
+		u8 gob_paylen;
+
+		if (trace->type.gobver != 0x00) {
+				NL_SET_ERR_MSG(extack,
+					       "Global-Opaque trace block version not supported");
+				return -EINVAL;
+		}
+
+		gob_hdr = nla_data(tb[IOAM6_IPTUNNEL_TRACE_GOB]);
+		if (!gob_hdr) {
+			NL_SET_ERR_MSG(extack,
+				       "missing Global-Opaque trace block");
+			return -EINVAL;
+		}
+
+		/* GOB payload len is on the first 8 bits of the header */
+		gob_paylen = be32_to_cpu(gob_hdr->hdr) >> 24;
+		if (gob_paylen * 4 > IOAM6_TRACE_GOB_DATA_SIZE_MAX) {
+			NL_SET_ERR_MSG(extack,
+				       "Global-Opaque trace block length is not valid");
+			return -EINVAL;
+		}
+
+		gob_len = sizeof(*gob_hdr) + gob_paylen * 4;
+	}
+
+	len_trace = trace->remlen * 4 + gob_len;
+	len_aligned = ALIGN(len_trace, 8);
 	lwt = lwtunnel_state_alloc(sizeof(*ilwt) + len_aligned);
 	if (!lwt)
 		return -ENOMEM;
@@ -217,8 +253,10 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 		}
 	}
 
+	total_len = sizeof(*tuninfo) + len_aligned;
+
 	tuninfo = ioam6_lwt_info(lwt);
-	tuninfo->eh.hdrlen = ((sizeof(*tuninfo) + len_aligned) >> 3) - 1;
+	tuninfo->eh.hdrlen = (total_len >> 3) - 1;
 	tuninfo->pad[0] = IPV6_TLV_PADN;
 	tuninfo->ioamh.type = IOAM6_TYPE_PREALLOC;
 	tuninfo->ioamh.opt_type = IPV6_TLV_IOAM;
@@ -227,10 +265,30 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 
 	memcpy(&tuninfo->traceh, trace, sizeof(*trace));
 
-	if (len_aligned - trace->remlen * 4) {
-		tuninfo->traceh.data[trace->remlen * 4] = IPV6_TLV_PADN;
-		tuninfo->traceh.data[trace->remlen * 4 + 1] = 2;
+	tail = (void *)tuninfo->traceh.data + trace->remlen * 4;
+
+	if (gob_len) {
+		struct ioam6_trace_gob_hdr *_hdr;
+
+		/* GOB follows the per-node trace data */
+		_hdr = (struct ioam6_trace_gob_hdr*)tail;
+		memcpy(_hdr, gob_hdr, sizeof(*_hdr));
+
+		/* update the tail to the end of the GOB */
+		tail = (void *)_hdr + gob_len;
 	}
+
+	if (len_aligned - len_trace) {
+		*(u8 *)tail = IPV6_TLV_PADN;
+		*(u8 *)(tail + 1) = 2;
+
+		/* no need to clean up the remaning 2 bytes as everything has
+		 * already filled with zeros.
+		 */
+		tail = tail + sizeof(__be32);
+	}
+
+	WARN_ON_ONCE((void *)tuninfo + total_len != tail);
 
 	lwt->type = LWTUNNEL_ENCAP_IOAM6;
 	lwt->flags |= LWTUNNEL_STATE_OUTPUT_REDIRECT;

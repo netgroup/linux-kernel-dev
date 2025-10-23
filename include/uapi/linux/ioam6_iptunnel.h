@@ -56,6 +56,8 @@ enum {
 	 */
 	IOAM6_IPTUNNEL_SRC,		/* struct in6_addr */
 
+	IOAM6_IPTUNNEL_TRACE_GOB,	/* struct ioam6_trace_gob_hdr */
+
 	__IOAM6_IPTUNNEL_MAX,
 };
 
