@@ -30,6 +30,21 @@ static void ioam6_sc_release(struct ioam6_schema *sc)
 	kfree_rcu(sc, rcu);
 }
 
+static void ioam6_gob_sc_free_callback_rcu(struct rcu_head *head)
+{
+	struct ioam6_gob_schema *gobsc;
+
+	gobsc = container_of(head, struct ioam6_gob_schema, rcu);
+	kfree(gobsc->bpf.name);
+	if (gobsc->bpf.prog)
+		bpf_prog_put(gobsc->bpf.prog);
+}
+
+static void ioam6_gob_sc_release(struct ioam6_gob_schema *gobsc)
+{
+	call_rcu(&gobsc->rcu, ioam6_gob_sc_free_callback_rcu);
+}
+
 static void ioam6_free_ns(void *ptr, void *arg)
 {
 	struct ioam6_namespace *ns = (struct ioam6_namespace *)ptr;
@@ -60,6 +75,14 @@ static int ioam6_sc_cmpfn(struct rhashtable_compare_arg *arg, const void *obj)
 	return (sc->id != *(u32 *)arg->key);
 }
 
+static int ioam6_gob_sc_cmpfn(struct rhashtable_compare_arg *arg,
+			      const void *obj)
+{
+	const struct ioam6_gob_schema *gobsc = obj;
+
+	return (gobsc->id != *(u32 *)arg->key);
+}
+
 static const struct rhashtable_params rht_ns_params = {
 	.key_len		= sizeof(__be16),
 	.key_offset		= offsetof(struct ioam6_namespace, id),
@@ -74,6 +97,14 @@ static const struct rhashtable_params rht_sc_params = {
 	.head_offset		= offsetof(struct ioam6_schema, head),
 	.automatic_shrinking	= true,
 	.obj_cmpfn		= ioam6_sc_cmpfn,
+};
+
+static const struct rhashtable_params rht_gob_sc_params = {
+	.key_len		= sizeof(u32),
+	.key_offset		= offsetof(struct ioam6_gob_schema, id),
+	.head_offset		= offsetof(struct ioam6_gob_schema, head),
+	.automatic_shrinking	= true,
+	.obj_cmpfn		= ioam6_gob_sc_cmpfn,
 };
 
 static struct genl_family ioam6_genl_family;
@@ -94,9 +125,23 @@ static const struct nla_policy ioam6_genl_policy_addsc[] = {
 				    .len = IOAM6_MAX_SCHEMA_DATA_LEN },
 };
 
+static const struct nla_policy ioam6_genl_policy_add_gobsc[] = {
+	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
+	[IOAM6_ATTR_GOB_SC_BPF]	= { .type = NLA_NESTED },
+};
+
+#define MAX_PROG_NAME 256
+static const struct nla_policy
+ioam_gob_bpf_prog_policy[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1] = {
+	[IOAM6_TRACE_GOB_BPF_PROG]	= { .type = NLA_U32, },
+	[IOAM6_TRACE_GOB_BPF_PROG_NAME]	= { .type = NLA_NUL_STRING,
+					    .len = MAX_PROG_NAME },
+};
+
 static const struct nla_policy ioam6_genl_policy_delsc[] = {
 	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
 };
+#define ioam6_genl_policy_del_gobsc ioam6_genl_policy_delsc 
 
 static const struct nla_policy ioam6_genl_policy_ns_sc[] = {
 	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
@@ -491,6 +536,125 @@ done:
 	return err;
 }
 
+static int ioam6_genl_add_gobsc(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nlattr *tb[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1];
+	struct ioam6_pernet_data *nsdata;
+	struct ioam6_gob_schema *gobsc;
+	struct bpf_prog *p;
+	u32 id, fd;
+	int err;
+
+	if (!info->attrs[IOAM6_ATTR_SC_ID] ||
+	    !info->attrs[IOAM6_ATTR_GOB_SC_BPF])
+		return -EINVAL;
+
+	id = nla_get_u32(info->attrs[IOAM6_ATTR_SC_ID]);
+
+	err = nla_parse_nested_deprecated(tb, IOAM6_TRACE_GOB_BPF_PROG_MAX,
+					  info->attrs[IOAM6_ATTR_GOB_SC_BPF],
+					  ioam_gob_bpf_prog_policy, NULL);
+	if (err < 0)
+		return err;
+
+	if (!tb[IOAM6_TRACE_GOB_BPF_PROG] || !tb[IOAM6_TRACE_GOB_BPF_PROG_NAME])
+		return -EINVAL;
+
+	nsdata = ioam6_pernet(genl_info_net(info));
+
+	mutex_lock(&nsdata->lock);
+
+	gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &id,
+				       rht_gob_sc_params);
+	if (gobsc) {
+		err = -EEXIST;
+		goto out_unlock;
+	}
+
+	gobsc = kzalloc(sizeof(*gobsc), GFP_KERNEL);
+	if (!gobsc) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+
+	gobsc->id = id;
+	gobsc->bpf.name = nla_memdup(tb[IOAM6_TRACE_GOB_BPF_PROG_NAME],
+				     GFP_KERNEL);
+	if (!gobsc->bpf.name) {
+		err = -ENOMEM;
+		goto free_sc;
+	}
+
+	fd = nla_get_u32(tb[IOAM6_TRACE_GOB_BPF_PROG]);
+
+	/* FIXME: the type should be carefully choosen... at the moment we use
+	 * IN because it avoids to modify the packet... but then we need of an
+	 * helper function or a kfunc to change the content of the GOB trace
+	 */
+	p = bpf_prog_get_type(fd, BPF_PROG_TYPE_LWT_IN);
+	if (IS_ERR(p)) {
+		err = PTR_ERR(p);
+		goto free_bpf_name;
+	}
+
+	gobsc->bpf.prog = p;
+
+	err = rhashtable_lookup_insert_fast(&nsdata->gob_schemas, &gobsc->head,
+					    rht_gob_sc_params);
+	if (err)
+		goto free_sc;
+
+out_unlock:
+	mutex_unlock(&nsdata->lock);
+	return err;
+free_bpf_name:
+	kfree(gobsc->bpf.name);
+free_sc:
+	kfree(gobsc);
+	goto out_unlock;
+}
+
+static int ioam6_genl_del_gobsc(struct sk_buff *skb, struct genl_info *info)
+{
+	struct ioam6_pernet_data *nsdata;
+	struct ioam6_gob_schema *gobsc;
+	struct ioam6_namespace *ns;
+	int err;
+	u32 id;
+
+	if (!info->attrs[IOAM6_ATTR_SC_ID])
+		return -EINVAL;
+
+	id = nla_get_u32(info->attrs[IOAM6_ATTR_SC_ID]);
+	nsdata = ioam6_pernet(genl_info_net(info));
+
+	mutex_lock(&nsdata->lock);
+
+	gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &id,
+				       rht_gob_sc_params);
+	if (!gobsc) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+
+	ns = rcu_dereference_protected(gobsc->ns,
+				       lockdep_is_held(&nsdata->lock));
+
+	err = rhashtable_remove_fast(&nsdata->gob_schemas, &gobsc->head,
+				     rht_gob_sc_params);
+	if (err)
+		goto out_unlock;
+
+	if (ns)
+		rcu_assign_pointer(ns->gob_schema, NULL);
+
+	ioam6_gob_sc_release(gobsc);
+
+out_unlock:
+	mutex_unlock(&nsdata->lock);
+	return err;
+}
+
 static int ioam6_genl_ns_set_schema(struct sk_buff *skb, struct genl_info *info)
 {
 	struct ioam6_namespace *ns, *ns_ref;
@@ -605,6 +769,22 @@ static const struct genl_ops ioam6_genl_ops[] = {
 		.flags	= GENL_ADMIN_PERM,
 		.policy	= ioam6_genl_policy_ns_sc,
 		.maxattr = ARRAY_SIZE(ioam6_genl_policy_ns_sc) - 1,
+	},
+	{
+		.cmd	= IOAM6_CMD_ADD_GOB_SCHEMA,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.doit	= ioam6_genl_add_gobsc,
+		.flags	= GENL_ADMIN_PERM,
+		.policy	= ioam6_genl_policy_add_gobsc,
+		.maxattr = ARRAY_SIZE(ioam6_genl_policy_add_gobsc) - 1,
+	},
+	{
+		.cmd	= IOAM6_CMD_DEL_GOB_SCHEMA,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.doit	= ioam6_genl_del_gobsc,
+		.flags	= GENL_ADMIN_PERM,
+		.policy	= ioam6_genl_policy_del_gobsc,
+		.maxattr = ARRAY_SIZE(ioam6_genl_policy_del_gobsc) - 1,
 	},
 };
 

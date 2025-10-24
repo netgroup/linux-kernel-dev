@@ -14,12 +14,14 @@
 #include <linux/ioam6.h>
 #include <linux/ioam6_genl.h>
 #include <linux/rhashtable-types.h>
+#include <linux/bpf.h>
 
 struct ioam6_namespace {
 	struct rhash_head head;
 	struct rcu_head rcu;
 
 	struct ioam6_schema __rcu *schema;
+	struct ioam6_gob_schema __rcu *gob_schema;
 
 	__be16 id;
 	__be32 data;
@@ -39,10 +41,26 @@ struct ioam6_schema {
 	u8 data[];
 };
 
+struct bpf_hbh_prog {
+	struct bpf_prog *prog;
+	char *name;
+};
+
+struct ioam6_gob_schema {
+	struct rhash_head head;
+	struct rcu_head rcu;
+
+	struct ioam6_namespace __rcu *ns;
+
+	u32 id;
+	struct bpf_hbh_prog bpf;
+};
+
 struct ioam6_pernet_data {
 	struct mutex lock;
 	struct rhashtable namespaces;
 	struct rhashtable schemas;
+	struct rhashtable gob_schemas;
 };
 
 static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
