@@ -265,6 +265,7 @@ static int __ioam6_genl_dumpns_element(struct ioam6_namespace *ns,
 				       struct sk_buff *skb,
 				       u8 cmd)
 {
+	struct ioam6_gob_schema *gobsc;
 	struct ioam6_schema *sc;
 	u64 data64;
 	u32 data32;
@@ -289,6 +290,12 @@ static int __ioam6_genl_dumpns_element(struct ioam6_namespace *ns,
 
 	sc = rcu_dereference(ns->schema);
 	if (sc && nla_put_u32(skb, IOAM6_ATTR_SC_ID, sc->id)) {
+		rcu_read_unlock();
+		goto nla_put_failure;
+	}
+
+	gobsc = rcu_dereference(ns->gob_schema);
+	if (gobsc && nla_put_u32(skb, IOAM6_ATTR_GOB_SC_ID, gobsc->id)) {
 		rcu_read_unlock();
 		goto nla_put_failure;
 	}
