@@ -151,13 +151,14 @@ ioam_gob_bpf_prog_policy[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1] = {
 static const struct nla_policy ioam6_genl_policy_delsc[] = {
 	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
 };
-#define ioam6_genl_policy_del_gobsc ioam6_genl_policy_delsc 
+#define ioam6_genl_policy_del_gobsc ioam6_genl_policy_delsc
 
 static const struct nla_policy ioam6_genl_policy_ns_sc[] = {
 	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
 	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
 	[IOAM6_ATTR_SC_NONE]	= { .type = NLA_FLAG },
 };
+#define ioam6_genl_policy_ns_gob_sc ioam6_genl_policy_ns_sc
 
 static int ioam6_genl_addns(struct sk_buff *skb, struct genl_info *info)
 {
@@ -724,6 +725,65 @@ out_unlock:
 	return err;
 }
 
+static int
+ioam6_genl_ns_set_gob_schema(struct sk_buff *skb, struct genl_info *info)
+{
+	struct ioam6_gob_schema *gobsc, *gobsc_ref;
+	struct ioam6_namespace *ns, *ns_ref;
+	struct ioam6_pernet_data *nsdata;
+	__be16 ns_id;
+	u32 gobsc_id;
+	int err;
+
+	if (!info->attrs[IOAM6_ATTR_NS_ID] ||
+	    (!info->attrs[IOAM6_ATTR_SC_ID] &&
+	     !info->attrs[IOAM6_ATTR_SC_NONE]))
+		return -EINVAL;
+
+	ns_id = cpu_to_be16(nla_get_u16(info->attrs[IOAM6_ATTR_NS_ID]));
+	nsdata = ioam6_pernet(genl_info_net(info));
+
+	mutex_lock(&nsdata->lock);
+
+	ns = rhashtable_lookup_fast(&nsdata->namespaces, &ns_id, rht_ns_params);
+	if (!ns) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+
+	if (info->attrs[IOAM6_ATTR_SC_NONE]) {
+		gobsc = NULL;
+	} else {
+		gobsc_id = nla_get_u32(info->attrs[IOAM6_ATTR_SC_ID]);
+		gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &gobsc_id,
+					       rht_gob_sc_params);
+		if (!gobsc) {
+			err = -ENOENT;
+			goto out_unlock;
+		}
+	}
+
+	gobsc_ref = rcu_dereference_protected(ns->gob_schema,
+					      lockdep_is_held(&nsdata->lock));
+	if (gobsc_ref)
+		rcu_assign_pointer(gobsc_ref->ns, NULL);
+	rcu_assign_pointer(ns->gob_schema, gobsc);
+
+	if (gobsc) {
+		ns_ref = rcu_dereference_protected(gobsc->ns,
+						   lockdep_is_held(&nsdata->lock));
+		if (ns_ref)
+			rcu_assign_pointer(ns_ref->gob_schema, NULL);
+		rcu_assign_pointer(gobsc->ns, ns);
+	}
+
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&nsdata->lock);
+	return err;
+}
+
 static const struct genl_ops ioam6_genl_ops[] = {
 	{
 		.cmd	= IOAM6_CMD_ADD_NAMESPACE,
@@ -797,6 +857,14 @@ static const struct genl_ops ioam6_genl_ops[] = {
 		.policy	= ioam6_genl_policy_del_gobsc,
 		.maxattr = ARRAY_SIZE(ioam6_genl_policy_del_gobsc) - 1,
 	},
+	{
+		.cmd	= IOAM6_CMD_NS_SET_GOB_SCHEMA,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.doit	= ioam6_genl_ns_set_gob_schema,
+		.flags	= GENL_ADMIN_PERM,
+		.policy	= ioam6_genl_policy_ns_gob_sc,
+		.maxattr = ARRAY_SIZE(ioam6_genl_policy_ns_gob_sc) - 1,
+	},
 };
 
 #define IOAM6_GENL_EV_GRP_OFFSET 0
@@ -868,7 +936,7 @@ static struct genl_family ioam6_genl_family __ro_after_init = {
 	.parallel_ops	= true,
 	.ops		= ioam6_genl_ops,
 	.n_ops		= ARRAY_SIZE(ioam6_genl_ops),
-	.resv_start_op	= IOAM6_CMD_DEL_GOB_SCHEMA + 1,
+	.resv_start_op	= IOAM6_CMD_MAX + 1,
 	.mcgrps		= ioam6_mcgrps,
 	.n_mcgrps	= ARRAY_SIZE(ioam6_mcgrps),
 	.module		= THIS_MODULE,
