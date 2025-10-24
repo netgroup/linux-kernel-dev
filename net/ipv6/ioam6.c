@@ -38,6 +38,8 @@ static void ioam6_gob_sc_free_callback_rcu(struct rcu_head *head)
 	kfree(gobsc->bpf.name);
 	if (gobsc->bpf.prog)
 		bpf_prog_put(gobsc->bpf.prog);
+
+	kfree(gobsc);
 }
 
 static void ioam6_gob_sc_release(struct ioam6_gob_schema *gobsc)
@@ -59,6 +61,14 @@ static void ioam6_free_sc(void *ptr, void *arg)
 
 	if (sc)
 		ioam6_sc_release(sc);
+}
+
+static void ioam6_free_gob_sc(void *ptr, void *arg)
+{
+	struct ioam6_gob_schema *gobsc = (struct ioam6_gob_schema *)ptr;
+
+	if (gobsc)
+		ioam6_gob_sc_release(gobsc);
 }
 
 static int ioam6_ns_cmpfn(struct rhashtable_compare_arg *arg, const void *obj)
@@ -602,11 +612,13 @@ static int ioam6_genl_add_gobsc(struct sk_buff *skb, struct genl_info *info)
 	err = rhashtable_lookup_insert_fast(&nsdata->gob_schemas, &gobsc->head,
 					    rht_gob_sc_params);
 	if (err)
-		goto free_sc;
+		goto free_bpf_prog;
 
 out_unlock:
 	mutex_unlock(&nsdata->lock);
 	return err;
+free_bpf_prog:
+	bpf_prog_put(gobsc->bpf.prog);
 free_bpf_name:
 	kfree(gobsc->bpf.name);
 free_sc:
@@ -637,14 +649,13 @@ static int ioam6_genl_del_gobsc(struct sk_buff *skb, struct genl_info *info)
 		goto out_unlock;
 	}
 
-	ns = rcu_dereference_protected(gobsc->ns,
-				       lockdep_is_held(&nsdata->lock));
-
 	err = rhashtable_remove_fast(&nsdata->gob_schemas, &gobsc->head,
 				     rht_gob_sc_params);
 	if (err)
 		goto out_unlock;
 
+	ns = rcu_dereference_protected(gobsc->ns,
+				       lockdep_is_held(&nsdata->lock));
 	if (ns)
 		rcu_assign_pointer(ns->gob_schema, NULL);
 
@@ -857,7 +868,7 @@ static struct genl_family ioam6_genl_family __ro_after_init = {
 	.parallel_ops	= true,
 	.ops		= ioam6_genl_ops,
 	.n_ops		= ARRAY_SIZE(ioam6_genl_ops),
-	.resv_start_op	= IOAM6_CMD_NS_SET_SCHEMA + 1,
+	.resv_start_op	= IOAM6_CMD_DEL_GOB_SCHEMA + 1,
 	.mcgrps		= ioam6_mcgrps,
 	.n_mcgrps	= ARRAY_SIZE(ioam6_mcgrps),
 	.module		= THIS_MODULE,
@@ -1156,8 +1167,14 @@ static int __net_init ioam6_net_init(struct net *net)
 	if (err)
 		goto free_rht_ns;
 
+	err = rhashtable_init(&nsdata->gob_schemas, &rht_gob_sc_params);
+	if (err)
+		goto free_sc;
+
 out:
 	return err;
+free_sc:
+	rhashtable_destroy(&nsdata->schemas);
 free_rht_ns:
 	rhashtable_destroy(&nsdata->namespaces);
 free_nsdata:
@@ -1172,6 +1189,8 @@ static void __net_exit ioam6_net_exit(struct net *net)
 
 	rhashtable_free_and_destroy(&nsdata->namespaces, ioam6_free_ns, NULL);
 	rhashtable_free_and_destroy(&nsdata->schemas, ioam6_free_sc, NULL);
+	rhashtable_free_and_destroy(&nsdata->gob_schemas, ioam6_free_gob_sc,
+				    NULL);
 
 	kfree(nsdata);
 }
