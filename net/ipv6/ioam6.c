@@ -562,6 +562,112 @@ done:
 	return err;
 }
 
+static int __ioam6_genl_dump_gobsc_element(struct ioam6_gob_schema *gobsc,
+					   u32 portid, u32 seq, u32 flags,
+					   struct sk_buff *skb, u8 cmd)
+{
+	struct ioam6_namespace *ns;
+	struct nlattr *nest;
+	void *hdr;
+
+	hdr = genlmsg_put(skb, portid, seq, &ioam6_genl_family, flags, cmd);
+	if (!hdr)
+		return -ENOMEM;
+
+	if (nla_put_u32(skb, IOAM6_ATTR_GOB_SC_ID, gobsc->id))
+		goto nla_put_failure;
+
+	nest = nla_nest_start_noflag(skb, IOAM6_ATTR_GOB_SC_BPF);
+	if (!nest)
+		goto nla_put_failure;
+
+	if (nla_put_u32(skb, IOAM6_TRACE_GOB_BPF_PROG,
+			gobsc->bpf.prog->aux->id))
+		goto nla_put_failure;
+
+	if (gobsc->bpf.name &&
+	    nla_put_string(skb, IOAM6_TRACE_GOB_BPF_PROG_NAME, gobsc->bpf.name))
+		goto nla_put_failure;
+
+	nla_nest_end(skb, nest);
+
+	rcu_read_lock();
+
+	ns = rcu_dereference(gobsc->ns);
+	if (ns && nla_put_u16(skb, IOAM6_ATTR_NS_ID, be16_to_cpu(ns->id))) {
+		rcu_read_unlock();
+		goto nla_put_failure;
+	}
+
+	rcu_read_unlock();
+
+	genlmsg_end(skb, hdr);
+	return 0;
+
+nla_put_failure:
+	genlmsg_cancel(skb, hdr);
+	return -EMSGSIZE;
+}
+
+static int ioam6_genl_dump_gobsc_start(struct netlink_callback *cb)
+{
+	struct ioam6_pernet_data *nsdata = ioam6_pernet(sock_net(cb->skb->sk));
+	struct rhashtable_iter *iter = (struct rhashtable_iter *)cb->args[0];
+
+	if (!iter) {
+		iter = kmalloc(sizeof(*iter), GFP_KERNEL);
+		if (!iter)
+			return -ENOMEM;
+
+		cb->args[0] = (long)iter;
+	}
+
+	rhashtable_walk_enter(&nsdata->gob_schemas, iter);
+
+	return 0;
+}
+
+#define ioam6_genl_dump_gobsc_done ioam6_genl_dumpsc_done
+
+static int
+ioam6_genl_dump_gobsc(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	struct ioam6_gob_schema *gobsc;
+	struct rhashtable_iter *iter;
+	int err;
+
+	iter = (struct rhashtable_iter *)cb->args[0];
+	rhashtable_walk_start(iter);
+
+	for (;;) {
+		gobsc = rhashtable_walk_next(iter);
+
+		if (IS_ERR(gobsc)) {
+			if (PTR_ERR(gobsc) == -EAGAIN)
+				continue;
+			err = PTR_ERR(gobsc);
+			goto done;
+		} else if (!gobsc) {
+			break;
+		}
+
+		err = __ioam6_genl_dump_gobsc_element(gobsc,
+						      NETLINK_CB(cb->skb).portid,
+						      cb->nlh->nlmsg_seq,
+						      NLM_F_MULTI,
+						      skb,
+						      IOAM6_CMD_DUMP_GOB_SCHEMAS);
+		if (err)
+			goto done;
+	}
+
+	err = skb->len;
+
+done:
+	rhashtable_walk_stop(iter);
+	return err;
+}
+
 static int ioam6_genl_add_gobsc(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nlattr *tb[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1];
@@ -879,6 +985,14 @@ static const struct genl_ops ioam6_genl_ops[] = {
 		.flags	= GENL_ADMIN_PERM,
 		.policy	= ioam6_genl_policy_ns_gob_sc,
 		.maxattr = ARRAY_SIZE(ioam6_genl_policy_ns_gob_sc) - 1,
+	},
+	{
+		.cmd	= IOAM6_CMD_DUMP_GOB_SCHEMAS,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.start	= ioam6_genl_dump_gobsc_start,
+		.dumpit	= ioam6_genl_dump_gobsc,
+		.done	= ioam6_genl_dump_gobsc_done,
+		.flags	= GENL_ADMIN_PERM,
 	},
 };
 
