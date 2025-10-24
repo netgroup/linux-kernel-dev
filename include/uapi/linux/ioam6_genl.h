@@ -26,7 +26,9 @@ enum {
 
 	IOAM6_ATTR_PAD,
 
+	IOAM6_ATTR_GOB_SC_ID,	/* u32 */
 	IOAM6_ATTR_GOB_SC_BPF,	/* BPF */
+	IOAM6_ATTR_GOB_SC_NONE,	/* Flag */
 
 	__IOAM6_ATTR_MAX,
 };

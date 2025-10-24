@@ -136,7 +136,7 @@ static const struct nla_policy ioam6_genl_policy_addsc[] = {
 };
 
 static const struct nla_policy ioam6_genl_policy_add_gobsc[] = {
-	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
+	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
 	[IOAM6_ATTR_GOB_SC_BPF]	= { .type = NLA_NESTED },
 };
 
@@ -151,14 +151,22 @@ ioam_gob_bpf_prog_policy[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1] = {
 static const struct nla_policy ioam6_genl_policy_delsc[] = {
 	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
 };
-#define ioam6_genl_policy_del_gobsc ioam6_genl_policy_delsc
+
+static const struct nla_policy ioam6_genl_policy_del_gobsc[] = {
+	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
+};
 
 static const struct nla_policy ioam6_genl_policy_ns_sc[] = {
 	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
 	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
 	[IOAM6_ATTR_SC_NONE]	= { .type = NLA_FLAG },
 };
-#define ioam6_genl_policy_ns_gob_sc ioam6_genl_policy_ns_sc
+
+static const struct nla_policy ioam6_genl_policy_ns_gob_sc[] = {
+	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
+	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
+	[IOAM6_ATTR_GOB_SC_NONE] = { .type = NLA_FLAG },
+};
 
 static int ioam6_genl_addns(struct sk_buff *skb, struct genl_info *info)
 {
@@ -556,11 +564,11 @@ static int ioam6_genl_add_gobsc(struct sk_buff *skb, struct genl_info *info)
 	u32 id, fd;
 	int err;
 
-	if (!info->attrs[IOAM6_ATTR_SC_ID] ||
+	if (!info->attrs[IOAM6_ATTR_GOB_SC_ID] ||
 	    !info->attrs[IOAM6_ATTR_GOB_SC_BPF])
 		return -EINVAL;
 
-	id = nla_get_u32(info->attrs[IOAM6_ATTR_SC_ID]);
+	id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
 
 	err = nla_parse_nested_deprecated(tb, IOAM6_TRACE_GOB_BPF_PROG_MAX,
 					  info->attrs[IOAM6_ATTR_GOB_SC_BPF],
@@ -635,10 +643,10 @@ static int ioam6_genl_del_gobsc(struct sk_buff *skb, struct genl_info *info)
 	int err;
 	u32 id;
 
-	if (!info->attrs[IOAM6_ATTR_SC_ID])
+	if (!info->attrs[IOAM6_ATTR_GOB_SC_ID])
 		return -EINVAL;
 
-	id = nla_get_u32(info->attrs[IOAM6_ATTR_SC_ID]);
+	id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
 	nsdata = ioam6_pernet(genl_info_net(info));
 
 	mutex_lock(&nsdata->lock);
@@ -736,8 +744,8 @@ ioam6_genl_ns_set_gob_schema(struct sk_buff *skb, struct genl_info *info)
 	int err;
 
 	if (!info->attrs[IOAM6_ATTR_NS_ID] ||
-	    (!info->attrs[IOAM6_ATTR_SC_ID] &&
-	     !info->attrs[IOAM6_ATTR_SC_NONE]))
+	    (!info->attrs[IOAM6_ATTR_GOB_SC_ID] &&
+	     !info->attrs[IOAM6_ATTR_GOB_SC_NONE]))
 		return -EINVAL;
 
 	ns_id = cpu_to_be16(nla_get_u16(info->attrs[IOAM6_ATTR_NS_ID]));
@@ -751,10 +759,10 @@ ioam6_genl_ns_set_gob_schema(struct sk_buff *skb, struct genl_info *info)
 		goto out_unlock;
 	}
 
-	if (info->attrs[IOAM6_ATTR_SC_NONE]) {
+	if (info->attrs[IOAM6_ATTR_GOB_SC_NONE]) {
 		gobsc = NULL;
 	} else {
-		gobsc_id = nla_get_u32(info->attrs[IOAM6_ATTR_SC_ID]);
+		gobsc_id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
 		gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &gobsc_id,
 					       rht_gob_sc_params);
 		if (!gobsc) {
