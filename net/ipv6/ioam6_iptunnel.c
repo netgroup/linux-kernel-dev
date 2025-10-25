@@ -134,6 +134,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 	struct ioam6_lwt *ilwt;
 	int len_aligned, err;
 	u32 freq_k, freq_n;
+	int ioamh_optlen;
 	int gob_len = 0;
 	int len_trace;
 	int total_len;
@@ -268,15 +269,20 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 		}
 	}
 
-	total_len = sizeof(*tuninfo) + len_aligned;
+	ioamh_optlen = sizeof(tuninfo->ioamh) - 2 + sizeof(*trace) + len_trace;
+	if (ioamh_optlen > U8_MAX) {
+		NL_SET_ERR_MSG(extack, "invalid overall trace length");
+		err = -EINVAL;
+		goto free_cache;
+	}
 
+	total_len = sizeof(*tuninfo) + len_aligned;
 	tuninfo = ioam6_lwt_info(lwt);
 	tuninfo->eh.hdrlen = (total_len >> 3) - 1;
 	tuninfo->pad[0] = IPV6_TLV_PADN;
 	tuninfo->ioamh.type = IOAM6_TYPE_PREALLOC;
 	tuninfo->ioamh.opt_type = IPV6_TLV_IOAM;
-	tuninfo->ioamh.opt_len = sizeof(tuninfo->ioamh) - 2 + sizeof(*trace)
-					+ trace->remlen * 4;
+	tuninfo->ioamh.opt_len = ioamh_optlen;
 
 	memcpy(&tuninfo->traceh, trace, sizeof(*trace));
 
