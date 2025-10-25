@@ -324,8 +324,31 @@ free_lwt:
 	return err;
 }
 
+/* called under rcu lock */
+static void
+ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
+		      struct ioam6_namespace *ns,
+		      struct ioam6_trace_gob_hdr *gob)
+{
+	__u8 hdr_len = (__u8)(__be32_to_cpu(gob->hdr) >> 24);
+	struct ioam6_gob_schema *gobsc = NULL;
+	__u32 schema_id;
+
+	if (ns)
+		gobsc = rcu_dereference(ns->gob_schema);
+
+	/* no GOB schema has been assigned to the current namespace,
+	 * let's use the DEFAULT GOB SCHEMA ID.
+	 */
+	schema_id = gobsc ? gobsc->id : IOAM6_DEFAULT_GOB_SCHEMA_ID;
+
+	/* update the packet GOB header */
+	gob->hdr = cpu_to_be32((hdr_len << 24) | (schema_id & 0x00ffffff));
+}
+
 static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 {
+	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_trace_hdr *trace;
 	struct ioam6_namespace *ns;
 
@@ -333,9 +356,19 @@ static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 					   + sizeof(struct ipv6_hopopt_hdr) + 2
 					   + sizeof(struct ioam6_hdr));
 
+	/* trace->remlen is modified in ioam6_fill_trace_data, so let's make a
+	 * copy of the original value so that we can determine where the GOB
+	 * header starts.
+	 */
+	gob = trace->type.gob ? ((struct ioam6_trace_gob_hdr *)
+				 &trace->data[trace->remlen * 4]) : NULL;
+
 	ns = ioam6_namespace(net, trace->namespace_id);
 	if (ns)
 		ioam6_fill_trace_data(skb, ns, trace, false);
+
+	if (gob)
+		ioam6_fill_gob_schema(net, skb, ns, gob);
 
 	return 0;
 }
