@@ -22,6 +22,9 @@
 #include <net/ip6_route.h>
 #include <net/addrconf.h>
 
+/* FIXME: note that eBPF must be available otherwhise it should ignore it */
+#include <linux/filter.h>
+
 #define IOAM6_MASK_SHORT_FIELDS 0xff100000
 #define IOAM6_MASK_WIDE_FIELDS 0xe00000
 
@@ -344,6 +347,13 @@ ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
 
 	/* update the packet GOB header */
 	gob->hdr = cpu_to_be32((hdr_len << 24) | (schema_id & 0x00ffffff));
+
+	if (!gobsc)
+		return;
+
+	/* Run the eBPF program associaed with this schema */
+	bpf_compute_data_pointers(skb);
+	bpf_prog_run_save_cb(gobsc->bpf.prog, skb);
 }
 
 static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
