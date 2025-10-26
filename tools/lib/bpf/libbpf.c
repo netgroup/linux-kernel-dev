@@ -226,6 +226,7 @@ static const char * const prog_type_name[] = {
 	[BPF_PROG_TYPE_SK_LOOKUP]		= "sk_lookup",
 	[BPF_PROG_TYPE_SYSCALL]			= "syscall",
 	[BPF_PROG_TYPE_NETFILTER]		= "netfilter",
+	[BPF_PROG_TYPE_IOAM6_GOB]		= "ioam6_gob",
 };
 
 static int __base_pr(enum libbpf_print_level level, const char *format,
@@ -6832,6 +6833,7 @@ static struct {
 	{ BPF_PROG_TYPE_SOCK_OPS,                "bpf_sock_ops" },
 	{ BPF_PROG_TYPE_SOCKET_FILTER,           "__sk_buff" },
 	{ BPF_PROG_TYPE_XDP,                     "xdp_md" },
+	{ BPF_PROG_TYPE_IOAM6_GOB,		"__sk_buff" },
 	/* all other program types don't have "named" context structs */
 };
 

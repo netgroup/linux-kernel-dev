@@ -8754,6 +8754,15 @@ lwt_seg6local_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	}
 }
 
+static const struct bpf_func_proto *
+ioam6_gob_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	default:
+		return lwt_out_func_proto(func_id, prog);
+	}
+}
+
 static bool bpf_skb_is_valid_access(int off, int size, enum bpf_access_type type,
 				    const struct bpf_prog *prog,
 				    struct bpf_insn_access_aux *info)
@@ -8929,6 +8938,15 @@ static bool lwt_is_valid_access(int off, int size,
 	}
 
 	return bpf_skb_is_valid_access(off, size, type, prog, info);
+}
+
+
+static bool ioam6_gob_is_valid_access(int off, int size,
+				      enum bpf_access_type type,
+				      const struct bpf_prog *prog,
+				      struct bpf_insn_access_aux *info)
+{
+	return lwt_is_valid_access(off, size, type, prog, info);
 }
 
 /* Attach type specific accesses */
@@ -11270,6 +11288,15 @@ const struct bpf_verifier_ops lwt_seg6local_verifier_ops = {
 const struct bpf_prog_ops lwt_seg6local_prog_ops = {
 };
 
+const struct bpf_verifier_ops ioam6_gob_verifier_ops = {
+	.get_func_proto		= ioam6_gob_func_proto,
+	.is_valid_access	= ioam6_gob_is_valid_access,
+	.convert_ctx_access	= bpf_convert_ctx_access,
+};
+
+const struct bpf_prog_ops ioam6_gob_prog_ops = {
+};
+
 const struct bpf_verifier_ops cg_sock_verifier_ops = {
 	.get_func_proto		= sock_filter_func_proto,
 	.is_valid_access	= sock_filter_is_valid_access,
@@ -12491,6 +12518,7 @@ static int __init bpf_kfunc_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
 					       &bpf_kfunc_set_sock_addr);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &bpf_kfunc_set_tcp_reqsk);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_IOAM6_GOB, &bpf_kfunc_set_skb);
 	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SOCK_OPS, &bpf_kfunc_set_sock_ops);
 }
 late_initcall(bpf_kfunc_init);

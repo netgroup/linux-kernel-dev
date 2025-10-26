@@ -220,6 +220,7 @@ enum btf_kfunc_hook {
 	BTF_KFUNC_HOOK_LWT,
 	BTF_KFUNC_HOOK_NETFILTER,
 	BTF_KFUNC_HOOK_KPROBE,
+	BTF_KFUNC_HOOK_IOAM6,
 	BTF_KFUNC_HOOK_MAX,
 };
 
@@ -8709,6 +8710,8 @@ static int bpf_prog_type_to_kfunc_hook(enum bpf_prog_type prog_type)
 		return BTF_KFUNC_HOOK_NETFILTER;
 	case BPF_PROG_TYPE_KPROBE:
 		return BTF_KFUNC_HOOK_KPROBE;
+	case BPF_PROG_TYPE_IOAM6_GOB:
+		return BTF_KFUNC_HOOK_IOAM6;
 	default:
 		return BTF_KFUNC_HOOK_MAX;
 	}

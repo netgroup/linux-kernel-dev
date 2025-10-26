@@ -719,11 +719,7 @@ static int ioam6_genl_add_gobsc(struct sk_buff *skb, struct genl_info *info)
 
 	fd = nla_get_u32(tb[IOAM6_TRACE_GOB_BPF_PROG]);
 
-	/* FIXME: the type should be carefully choosen... at the moment we use
-	 * IN because it avoids to modify the packet... but then we need of an
-	 * helper function or a kfunc to change the content of the GOB trace
-	 */
-	p = bpf_prog_get_type(fd, BPF_PROG_TYPE_LWT_IN);
+	p = bpf_prog_get_type(fd, BPF_PROG_TYPE_IOAM6_GOB);
 	if (IS_ERR(p)) {
 		err = PTR_ERR(p);
 		goto free_bpf_name;
