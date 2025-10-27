@@ -320,50 +320,41 @@ free_lwt:
 	return err;
 }
 
-/* called with rcu_read_lock() */
-static int ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
-				 struct ioam6_namespace *ns,
-				 struct ioam6_trace_gob_hdr *gob)
+static void ioam6_fill_gob_hdr(struct net *net, struct sk_buff *skb,
+			       struct ioam6_namespace *ns,
+			       struct ioam6_trace_gob_hdr *gob)
 {
 	__u8 hdr_len = (__u8)(__be32_to_cpu(gob->hdr) >> 24);
-	struct ioam6_gob_schema *gobsc = NULL;
+	struct ioam6_gob_schema *gobsc;
 	__u32 schema_id;
-	int ret;
 
-	if (ns)
-		gobsc = rcu_dereference(ns->gob_schema);
-
-	/* no GOB schema has been assigned to the current namespace,
-	 * let's use the DEFAULT GOB SCHEMA ID.
-	 */
+	gobsc = ns ? rcu_dereference(ns->gob_schema) : NULL;
 	schema_id = gobsc ? gobsc->id : IOAM6_DEFAULT_GOB_SCHEMA_ID;
 
 	/* update the packet GOB header */
 	gob->hdr = cpu_to_be32((hdr_len << 24) |
 		   (schema_id & IOAM6_TRACE_GOB_SCHEMA_ID_MASK));
+}
 
-	if (!gobsc)
-		goto out;
+/* called with rcu_read_lock() */
+static int ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
+				 struct ioam6_namespace *ns,
+				 struct ioam6_trace_hdr *trace)
+{
+	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_get(trace);
 
-	/* Run the eBPF program associaed with this GOB schema */
-	bpf_compute_data_pointers(skb);
-	ret = bpf_prog_run_save_cb(gobsc->bpf.prog, skb);
-	switch (ret) {
-	case BPF_OK:
-		break;
-	case BPF_DROP:
-		return -EINVAL;
-	default:
-		pr_warn_once("bpf-ioam6-gob: Illegal return value %d\n", ret);
-		return -EFAULT;
-	}
-out:
-	return 0;
+	if (!gob)
+		return 0;
+
+	/* the GOB header is present, let's set it */
+	ioam6_fill_gob_hdr(net, skb, ns, gob);
+
+	/* ignore the gob trace filling for unknown namespace */
+	return ns ? ioam6_fill_gob_trace_data(skb, ns, trace) : 0;
 }
 
 static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 {
-	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_trace_hdr *trace;
 	struct ioam6_namespace *ns;
 
@@ -375,10 +366,7 @@ static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 	if (ns)
 		ioam6_fill_trace_data(skb, ns, trace, false);
 
-	/* update node data list comes first than GOB */
-	gob = ioam6_trace_gob_hdr_get(trace);
-
-	return !gob ? 0 : ioam6_fill_gob_schema(net, skb, ns, gob);
+	return ioam6_fill_gob_schema(net, skb, ns, trace);
 }
 
 static int ioam6_do_inline(struct net *net, struct sk_buff *skb,

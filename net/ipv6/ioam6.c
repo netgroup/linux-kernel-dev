@@ -1330,16 +1330,15 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
 }
 
 /* called with rcu_read_lock() */
-static int ioam6_fill_gob_trace_data(struct sk_buff *skb,
-				     struct ioam6_namespace *ns,
-				     struct ioam6_trace_hdr *trace)
+int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
+			      struct ioam6_trace_hdr *trace)
 {
-	struct ioam6_trace_gob_hdr *gob_hdr = ioam6_trace_gob_hdr_get(trace);
+	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_get(trace);
 	struct ioam6_gob_schema *gobsc;
+	int ret, err = 0;
 	__u32 hdr_scid;
-	int ret;
 
-	if (!gob_hdr)
+	if (!gob)
 		goto out;
 
 	gobsc = rcu_dereference(ns->gob_schema);
@@ -1350,7 +1349,7 @@ static int ioam6_fill_gob_trace_data(struct sk_buff *skb,
 	 * with this namespace and compare it with the Schema ID carried by the
 	 * GOB Header.
 	 */
-	hdr_scid = __be32_to_cpu(gob_hdr->hdr) & IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
+	hdr_scid = __be32_to_cpu(gob->hdr) & IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
 	if (hdr_scid != gobsc->id)
 		goto out;
 
@@ -1363,13 +1362,15 @@ static int ioam6_fill_gob_trace_data(struct sk_buff *skb,
 	case BPF_OK:
 		break;
 	case BPF_DROP:
-		return -EINVAL;
+		err = -EINVAL;
+		break;
 	default:
 		pr_warn_once("bpf-ioam6-gob: Illegal return value %d\n", ret);
-		return -EFAULT;
+		err = -EFAULT;
+		break;
 	}
 out:
-	return 0;
+	return err;
 }
 
 /* called with rcu_read_lock() */

@@ -76,6 +76,8 @@ struct ioam6_trace_gob_hdr *
 ioam6_trace_gob_hdr_get(struct ioam6_trace_hdr *trace);
 int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr);
 __u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace);
+int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
+			      struct ioam6_trace_hdr *trace);
 
 struct ioam6_namespace *ioam6_namespace(struct net *net, __be16 id);
 int ioam6_fill_trace_data(struct sk_buff *skb,
