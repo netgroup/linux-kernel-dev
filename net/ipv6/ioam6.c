@@ -21,6 +21,13 @@
 #include <net/sch_generic.h>
 
 #include <linux/filter.h>
+#include <linux/bpf.h>
+#include <linux/btf.h>
+#include <linux/btf_ids.h>
+
+DEFINE_PER_CPU(struct ioam6_bpf_trace_state, ioam6_bpf_trace_states) = {
+	.bh_lock	= INIT_LOCAL_LOCK(bh_lock),
+};
 
 struct ioam6_trace_gob_hdr *
 ioam6_trace_gob_hdr_get(struct ioam6_trace_hdr *trace)
@@ -1334,6 +1341,7 @@ int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 			      struct ioam6_trace_hdr *trace)
 {
 	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_get(trace);
+	struct ioam6_bpf_trace_state *ioam6_state;
 	struct ioam6_gob_schema *gobsc;
 	int ret, err = 0;
 	__u32 hdr_scid;
@@ -1356,6 +1364,11 @@ int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	/* The GOB Header carries the same Schema ID active on the current node
 	 * (due to the binding to the current namespace).
 	 */
+
+	local_lock_nested_bh(&ioam6_bpf_trace_states.bh_lock);
+	ioam6_state = this_cpu_ptr(&ioam6_bpf_trace_states);
+	ioam6_state->trace = trace;
+
 	bpf_compute_data_pointers(skb);
 	ret = bpf_prog_run_save_cb(gobsc->bpf.prog, skb);
 	switch (ret) {
@@ -1369,6 +1382,8 @@ int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 		err = -EFAULT;
 		break;
 	}
+
+	local_unlock_nested_bh(&ioam6_bpf_trace_states.bh_lock);
 out:
 	return err;
 }
@@ -1462,9 +1477,102 @@ static void __net_exit ioam6_net_exit(struct net *net)
 	kfree(nsdata);
 }
 
+
+static inline int __bpf_try_make_writable(struct sk_buff *skb,
+					  unsigned int write_len)
+{
+#ifdef CONFIG_DEBUG_NET
+	/* Avoid a splat in pskb_may_pull_reason() */
+	if (write_len > INT_MAX)
+		return -EINVAL;
+#endif
+	return skb_ensure_writable(skb, write_len);
+}
+
+static inline int bpf_try_make_writable(struct sk_buff *skb,
+					unsigned int write_len)
+{
+	int err = __bpf_try_make_writable(skb, write_len);
+
+	bpf_compute_data_pointers(skb);
+	return err;
+}
+
+__bpf_kfunc_start_defs();
+
+__bpf_kfunc int
+bpf_ioam_trace_gob_data_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
+				    const void *from, u32 from__sz)
+{
+	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
+	struct ioam6_bpf_trace_state *ioam6_trace_state;
+	int gob_poffset, skb_data_poffset;
+	struct ioam6_trace_gob_hdr *gob;
+	const int from_len = from__sz;
+	struct ioam6_trace_hdr *trace;
+	void *pend, *ptr, *pdata;
+	int pdata_len;
+
+	ioam6_trace_state = this_cpu_ptr(&ioam6_bpf_trace_states);
+	trace = ioam6_trace_state->trace;
+
+	lockdep_assert_held(&ioam6_trace_state->bh_lock);
+	if (unlikely(!trace))
+		return -EINVAL;
+
+	gob = ioam6_trace_gob_hdr_get(trace);
+	if (unlikely(!gob))
+		return -EINVAL;
+
+	pdata_len = ioam6_trace_gob_len(gob) - sizeof(*gob);
+	if (pdata_len == 0)
+		/* GOB does not come with payload, it's only for signaling */
+		return -ENOMEM;
+
+	/* payload of the GOB */
+	pdata = trace->data + sizeof(*gob);
+	pend = (void *)pdata + pdata_len;
+
+	ptr = (void *)pdata + offset;
+	if (ptr < pdata || ptr + from_len > pend)
+		/* out of bounds */
+		return -EFAULT;
+
+	/* offset w.r.t. the GOB payload start with respect to skb->data */
+	gob_poffset = (void *)pdata - (void *)skb->data;
+	/* At least the gob_poffset must be after the ipv6hdr + the first two
+	 * fields of the HBH ...
+	 */
+	WARN_ON_ONCE(gob_poffset <= sizeof(struct ipv6hdr) +
+				    sizeof(struct ipv6_hopopt_hdr));
+
+	/* offset where the user want to write within the GOB payload evaluated
+	 * w.r.t. to the skb->data.
+	 */
+	skb_data_poffset = gob_poffset + offset;
+
+	if (unlikely(bpf_try_make_writable(skb, skb_data_poffset + from_len)))
+		return -EFAULT;
+
+	/* gob_poffset don't change with bpf_try_make_writable */
+	memcpy(skb->data + skb_data_poffset, from, from_len);
+	return 0;
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(ioam_kfunc_fset)
+BTF_ID_FLAGS(func, bpf_ioam_trace_gob_data_store_bytes)
+BTF_KFUNCS_END(ioam_kfunc_fset)
+
 static struct pernet_operations ioam6_net_ops = {
 	.init = ioam6_net_init,
 	.exit = ioam6_net_exit,
+};
+
+static const struct btf_kfunc_id_set ioam_bpf_kfunc_fset = {
+	.owner = THIS_MODULE,
+	.set   = &ioam_kfunc_fset,
 };
 
 int __init ioam6_init(void)
@@ -1477,6 +1585,11 @@ int __init ioam6_init(void)
 	if (err)
 		goto out_unregister_pernet_subsys;
 
+	err = register_btf_kfunc_id_set(BPF_PROG_TYPE_IOAM6_GOB,
+					&ioam_bpf_kfunc_fset);
+	if (err)
+		goto out_unregister_genl;
+
 #ifdef CONFIG_IPV6_IOAM6_LWTUNNEL
 	err = ioam6_iptunnel_init();
 	if (err)
@@ -1487,10 +1600,9 @@ int __init ioam6_init(void)
 
 out:
 	return err;
-#ifdef CONFIG_IPV6_IOAM6_LWTUNNEL
+
 out_unregister_genl:
 	genl_unregister_family(&ioam6_genl_family);
-#endif
 out_unregister_pernet_subsys:
 	unregister_pernet_subsys(&ioam6_net_ops);
 	goto out;

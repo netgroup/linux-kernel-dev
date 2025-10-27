@@ -15,6 +15,7 @@
 #include <linux/ioam6_genl.h>
 #include <linux/rhashtable-types.h>
 #include <linux/bpf.h>
+#include <linux/percpu.h>
 
 struct ioam6_namespace {
 	struct rhash_head head;
@@ -62,6 +63,13 @@ struct ioam6_pernet_data {
 	struct rhashtable schemas;
 	struct rhashtable gob_schemas;
 };
+
+struct ioam6_bpf_trace_state {
+	local_lock_t bh_lock;
+	struct ioam6_trace_hdr *trace;
+};
+
+DECLARE_PER_CPU(struct ioam6_bpf_trace_state, ioam6_bpf_trace_states);
 
 static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
 {
