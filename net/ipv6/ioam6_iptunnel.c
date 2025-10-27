@@ -112,16 +112,7 @@ static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 static struct ioam6_trace_gob_hdr *
 ioam6_lwt_trace_gob_hdr(struct ioam6_lwt_encap *tuninfo)
 {
-	struct ioam6_trace_hdr *traceh = &tuninfo->traceh;
-	void *tail;
-
-	if (!traceh->type.gob)
-		/* GOB is not configured */
-		return NULL;
-
-	tail = (void *)traceh->data + traceh->remlen * 4;
-
-	return (struct ioam6_trace_gob_hdr *)tail;
+	return ioam6_trace_gob_hdr_get(&tuninfo->traceh);
 }
 
 static int ioam6_build_state(struct net *net, struct nlattr *nla,
@@ -289,7 +280,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 
 	memcpy(&tuninfo->traceh, trace, sizeof(*trace));
 
-	tail = (void *)tuninfo->traceh.data + trace->remlen * 4;
+	tail = (void *)tuninfo->traceh.data;
 
 	if (gob_len) {
 		struct ioam6_trace_gob_hdr *_hdr;
@@ -301,6 +292,8 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 		/* update the tail to the end of the GOB */
 		tail = (void *)_hdr + gob_len;
 	}
+
+	tail += trace->remlen * 4;
 
 	if (len_aligned - len_trace) {
 		*(u8 *)tail = IPV6_TLV_PADN;
@@ -377,16 +370,12 @@ static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 					   + sizeof(struct ipv6_hopopt_hdr) + 2
 					   + sizeof(struct ioam6_hdr));
 
-	/* trace->remlen is modified in ioam6_fill_trace_data, so let's make a
-	 * copy of the original value so that we can determine where the GOB
-	 * header starts.
-	 */
-	gob = trace->type.gob ? ((struct ioam6_trace_gob_hdr *)
-				 &trace->data[trace->remlen * 4]) : NULL;
-
 	ns = ioam6_namespace(net, trace->namespace_id);
 	if (ns)
 		ioam6_fill_trace_data(skb, ns, trace, false);
+
+	/* update node data list comes first than GOB */
+	gob = ioam6_trace_gob_hdr_get(trace);
 
 	return !gob ? 0 : ioam6_fill_gob_schema(net, skb, ns, gob);
 }

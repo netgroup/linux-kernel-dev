@@ -20,6 +20,30 @@
 #include <net/ioam6.h>
 #include <net/sch_generic.h>
 
+struct ioam6_trace_gob_hdr *
+ioam6_trace_gob_hdr_get(struct ioam6_trace_hdr *trace)
+{
+	return trace->type.gob ? (struct ioam6_trace_gob_hdr *)trace->data :
+		                 NULL;
+}
+
+int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
+{
+	return sizeof(*gob_hdr) + (__be32_to_cpu(gob_hdr->hdr) >> 24) * 4;
+}
+
+__u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
+{
+	struct ioam6_trace_gob_hdr *gob_hdr;
+	int off = 0;
+
+	gob_hdr = ioam6_trace_gob_hdr_get(trace);
+	if (gob_hdr)
+		off = ioam6_trace_gob_len(gob_hdr);
+
+	return trace->data + off;
+}
+
 static void ioam6_ns_release(struct ioam6_namespace *ns)
 {
 	kfree_rcu(ns, rcu);
@@ -1010,7 +1034,7 @@ static int ioam6_event_put_trace(struct sk_buff *skb,
 			be32_to_cpu(trace->type_be32)) ||
 	    nla_put(skb, IOAM6_EVENT_ATTR_TRACE_DATA,
 		    len - sizeof(struct ioam6_trace_hdr) - trace->remlen * 4,
-		    trace->data + trace->remlen * 4))
+		    ioam6_trace_data_get(trace) + trace->remlen * 4))
 		return 1;
 
 	return 0;
@@ -1089,7 +1113,8 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
 	u8 *data;
 	u8 byte;
 
-	data = trace->data + trace->remlen * 4 - trace->nodelen * 4 - sclen * 4;
+	data = ioam6_trace_data_get(trace) + trace->remlen * 4 -
+	       trace->nodelen * 4 - sclen * 4;
 
 	/* hop_lim and node_id */
 	if (trace->type.bit0) {
