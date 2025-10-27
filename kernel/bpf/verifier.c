@@ -17292,6 +17292,9 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
 			return 0;
 		range = retval_range(0, 0);
 		break;
+	case BPF_PROG_TYPE_IOAM6_GOB:
+		range = retval_range(BPF_OK, BPF_DROP);
+		break;
 	case BPF_PROG_TYPE_EXT:
 		/* freplace program can return anything as its return value
 		 * depends on the to-be-replaced kernel func or bpf program.
