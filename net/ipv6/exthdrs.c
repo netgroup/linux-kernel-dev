@@ -905,6 +905,7 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
 	struct ioam6_trace_hdr *trace;
 	struct ioam6_namespace *ns;
 	struct ioam6_hdr *hdr;
+	int ret = 0;
 
 	/* Bad alignment (must be 4n-aligned) */
 	if (optoff & 3)
@@ -946,10 +947,17 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
 		trace = (struct ioam6_trace_hdr *)(skb_network_header(skb)
 						   + optoff + sizeof(*hdr));
 
-		ioam6_fill_trace_data(skb, ns, trace, true);
+		ret = ioam6_fill_trace_data(skb, ns, trace, true);
 
 		ioam6_event(IOAM6_EVENT_TRACE, dev_net(skb->dev),
 			    GFP_ATOMIC, (void *)trace, hdr->opt_len - 2);
+
+		/* depending on the outcome of the ioam6_fill_trace_data() we
+		 * decide what to do w/ this packet. The only reason this
+		 * packet could be dropped is due to the GOB processing.
+		 */
+		if (ret)
+			goto drop;
 		break;
 	default:
 		break;

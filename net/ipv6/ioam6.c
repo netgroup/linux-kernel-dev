@@ -20,6 +20,8 @@
 #include <net/ioam6.h>
 #include <net/sch_generic.h>
 
+#include <linux/filter.h>
+
 struct ioam6_trace_gob_hdr *
 ioam6_trace_gob_hdr_get(struct ioam6_trace_hdr *trace)
 {
@@ -1328,10 +1330,53 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
 }
 
 /* called with rcu_read_lock() */
-void ioam6_fill_trace_data(struct sk_buff *skb,
-			   struct ioam6_namespace *ns,
-			   struct ioam6_trace_hdr *trace,
-			   bool is_input)
+static int ioam6_fill_gob_trace_data(struct sk_buff *skb,
+				     struct ioam6_namespace *ns,
+				     struct ioam6_trace_hdr *trace)
+{
+	struct ioam6_trace_gob_hdr *gob_hdr = ioam6_trace_gob_hdr_get(trace);
+	struct ioam6_gob_schema *gobsc;
+	__u32 hdr_scid;
+	int ret;
+
+	if (!gob_hdr)
+		goto out;
+
+	gobsc = rcu_dereference(ns->gob_schema);
+	if (!gobsc)
+		goto out;
+
+	/* GOB Schema is available, let's retrieve the GOB Schema ID associated
+	 * with this namespace and compare it with the Schema ID carried by the
+	 * GOB Header.
+	 */
+	hdr_scid = __be32_to_cpu(gob_hdr->hdr) & IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
+	if (hdr_scid != gobsc->id)
+		goto out;
+
+	/* The GOB Header carries the same Schema ID active on the current node
+	 * (due to the binding to the current namespace).
+	 */
+	bpf_compute_data_pointers(skb);
+	ret = bpf_prog_run_save_cb(gobsc->bpf.prog, skb);
+	switch (ret) {
+	case BPF_OK:
+		break;
+	case BPF_DROP:
+		return -EINVAL;
+	default:
+		pr_warn_once("bpf-ioam6-gob: Illegal return value %d\n", ret);
+		return -EFAULT;
+	}
+out:
+	return 0;
+}
+
+/* called with rcu_read_lock() */
+int ioam6_fill_trace_data(struct sk_buff *skb,
+			  struct ioam6_namespace *ns,
+			  struct ioam6_trace_hdr *trace,
+			  bool is_input)
 {
 	struct ioam6_schema *sc;
 	u8 sclen = 0;
@@ -1339,7 +1384,7 @@ void ioam6_fill_trace_data(struct sk_buff *skb,
 	/* Skip if Overflow flag is set
 	 */
 	if (trace->overflow)
-		return;
+		goto out;
 
 	/* NodeLen does not include Opaque State Snapshot length. We need to
 	 * take it into account if the corresponding bit is set (bit 22) and
@@ -1358,11 +1403,14 @@ void ioam6_fill_trace_data(struct sk_buff *skb,
 	 */
 	if (!trace->remlen || trace->remlen < trace->nodelen + sclen) {
 		trace->overflow = 1;
-		return;
+		goto out;
 	}
 
 	__ioam6_fill_trace_data(skb, ns, trace, sc, sclen, is_input);
 	trace->remlen -= trace->nodelen + sclen;
+
+out:
+	return ioam6_fill_gob_trace_data(skb, ns, trace);
 }
 
 static int __net_init ioam6_net_init(struct net *net)

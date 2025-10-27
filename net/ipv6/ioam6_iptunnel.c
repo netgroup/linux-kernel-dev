@@ -339,7 +339,8 @@ static int ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
 	schema_id = gobsc ? gobsc->id : IOAM6_DEFAULT_GOB_SCHEMA_ID;
 
 	/* update the packet GOB header */
-	gob->hdr = cpu_to_be32((hdr_len << 24) | (schema_id & 0x00ffffff));
+	gob->hdr = cpu_to_be32((hdr_len << 24) |
+		   (schema_id & IOAM6_TRACE_GOB_SCHEMA_ID_MASK));
 
 	if (!gobsc)
 		goto out;
