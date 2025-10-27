@@ -327,15 +327,15 @@ free_lwt:
 	return err;
 }
 
-/* called under rcu lock */
-static void
-ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
-		      struct ioam6_namespace *ns,
-		      struct ioam6_trace_gob_hdr *gob)
+/* called with rcu_read_lock() */
+static int ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
+				 struct ioam6_namespace *ns,
+				 struct ioam6_trace_gob_hdr *gob)
 {
 	__u8 hdr_len = (__u8)(__be32_to_cpu(gob->hdr) >> 24);
 	struct ioam6_gob_schema *gobsc = NULL;
 	__u32 schema_id;
+	int ret;
 
 	if (ns)
 		gobsc = rcu_dereference(ns->gob_schema);
@@ -349,11 +349,22 @@ ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
 	gob->hdr = cpu_to_be32((hdr_len << 24) | (schema_id & 0x00ffffff));
 
 	if (!gobsc)
-		return;
+		goto out;
 
-	/* Run the eBPF program associaed with this schema */
+	/* Run the eBPF program associaed with this GOB schema */
 	bpf_compute_data_pointers(skb);
-	bpf_prog_run_save_cb(gobsc->bpf.prog, skb);
+	ret = bpf_prog_run_save_cb(gobsc->bpf.prog, skb);
+	switch (ret) {
+	case BPF_OK:
+		break;
+	case BPF_DROP:
+		return -EINVAL;
+	default:
+		pr_warn_once("bpf-ioam6-gob: Illegal return value %d\n", ret);
+		return -EFAULT;
+	}
+out:
+	return 0;
 }
 
 static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
@@ -377,10 +388,7 @@ static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 	if (ns)
 		ioam6_fill_trace_data(skb, ns, trace, false);
 
-	if (gob)
-		ioam6_fill_gob_schema(net, skb, ns, gob);
-
-	return 0;
+	return !gob ? 0 : ioam6_fill_gob_schema(net, skb, ns, gob);
 }
 
 static int ioam6_do_inline(struct net *net, struct sk_buff *skb,
