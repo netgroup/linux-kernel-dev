@@ -112,7 +112,7 @@ static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 static struct ioam6_trace_gob_hdr *
 ioam6_lwt_trace_gob_hdr(struct ioam6_lwt_encap *tuninfo)
 {
-	return ioam6_trace_gob_hdr_get(&tuninfo->traceh);
+	return ioam6_trace_gob_hdr_start(&tuninfo->traceh);
 }
 
 static int ioam6_build_state(struct net *net, struct nlattr *nla,
@@ -341,7 +341,7 @@ static int ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
 				 struct ioam6_namespace *ns,
 				 struct ioam6_trace_hdr *trace)
 {
-	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_get(trace);
+	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_start(trace);
 
 	if (!gob)
 		return 0;

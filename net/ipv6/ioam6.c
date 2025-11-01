@@ -29,24 +29,77 @@ DEFINE_PER_CPU(struct ioam6_bpf_trace_state, ioam6_bpf_trace_states) = {
 	.bh_lock	= INIT_LOCAL_LOCK(bh_lock),
 };
 
+bool is_ioam6_trace_gob_present(struct ioam6_trace_hdr *trace)
+{
+	return !!trace->type.gob;
+}
+
+static struct ioam6_trace_gob_hdr *
+__ioam6_trace_gob_hdr_start_nocheck(struct ioam6_trace_hdr *trace)
+{
+	return (struct ioam6_trace_gob_hdr *)trace->data;
+}
+
 struct ioam6_trace_gob_hdr *
-ioam6_trace_gob_hdr_get(struct ioam6_trace_hdr *trace)
+ioam6_trace_gob_hdr_start(struct ioam6_trace_hdr *trace)
 {
-	return trace->type.gob ? (struct ioam6_trace_gob_hdr *)trace->data :
-		                 NULL;
+	return is_ioam6_trace_gob_present(trace) ?
+		__ioam6_trace_gob_hdr_start_nocheck(trace) : NULL;
 }
 
-int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
+static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 {
-	return sizeof(*gob_hdr) + (__be32_to_cpu(gob_hdr->hdr) >> 24) * 4;
+	int off = ptr - (void *)skb->data;
+
+	WARN_ON_ONCE(off < 0);
+	return off;
 }
 
-__u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
+static int ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)
+{
+	return (__be32_to_cpu(gob_hdr->hdr) >> 24) * 4;
+}
+
+static int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
+{
+	return sizeof(*gob_hdr) + ioam6_trace_gob_plen(gob_hdr);
+}
+
+static struct ioam6_trace_gob_hdr *
+ioam6_trace_gob_hdr_pointer(struct sk_buff *skb,
+			    struct ioam6_trace_hdr **trace)
+{
+	struct ioam6_trace_gob_hdr *gob;
+	struct ioam6_trace_hdr *th;
+	int trace_off, len;
+
+	if (!ioam6_trace_gob_hdr_start(*trace))
+		return NULL;
+
+	trace_off = ptroff_by_skb_data(skb, *trace);
+	len = sizeof(*th) + sizeof(*gob);
+	/* we read the ioam6_trace_hdr + ioam6_gob_hdr */
+	if (unlikely(!pskb_may_pull(skb, trace_off + len)))
+		return NULL;
+
+	th = (struct ioam6_trace_hdr *)(skb->data + trace_off);
+
+	/* we update the trace pointer for being valid in the caller.
+	 * At the same time we can be sure that gob header is present and
+	 * readable.
+	 */
+	gob = __ioam6_trace_gob_hdr_start_nocheck(th);
+	*trace = th;
+
+	return gob;
+}
+
+static __u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
 {
 	struct ioam6_trace_gob_hdr *gob_hdr;
 	int off = 0;
 
-	gob_hdr = ioam6_trace_gob_hdr_get(trace);
+	gob_hdr = ioam6_trace_gob_hdr_start(trace);
 	if (gob_hdr)
 		off = ioam6_trace_gob_len(gob_hdr);
 
@@ -1340,12 +1393,13 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
 int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 			      struct ioam6_trace_hdr *trace)
 {
-	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_get(trace);
 	struct ioam6_bpf_trace_state *ioam6_state;
+	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_gob_schema *gobsc;
 	int ret, err = 0;
 	__u32 hdr_scid;
 
+	gob = ioam6_trace_gob_hdr_pointer(skb, &trace);
 	if (!gob)
 		goto out;
 
@@ -1367,6 +1421,7 @@ int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 
 	local_lock_nested_bh(&ioam6_bpf_trace_states.bh_lock);
 	ioam6_state = this_cpu_ptr(&ioam6_bpf_trace_states);
+	/* ioam6_trace_gob_hdr_pointer() takes care of updating trace pointer */
 	ioam6_state->trace = trace;
 
 	bpf_compute_data_pointers(skb);
@@ -1498,6 +1553,12 @@ static inline int bpf_try_make_writable(struct sk_buff *skb,
 	return err;
 }
 
+static struct ioam6_trace_hdr *
+__reload_ioam6_trace_hdr_pointer(struct sk_buff *skb, int toff)
+{
+	return (struct ioam6_trace_hdr *)(skb->data + toff);
+}
+
 __bpf_kfunc_start_defs();
 
 __bpf_kfunc int
@@ -1506,7 +1567,7 @@ bpf_ioam_trace_gob_data_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
 {
 	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
 	struct ioam6_bpf_trace_state *ioam6_trace_state;
-	int gob_poffset, skb_data_poffset;
+	int gob_poffset, skb_data_poffset, trace_offset;
 	struct ioam6_trace_gob_hdr *gob;
 	const int from_len = from__sz;
 	struct ioam6_trace_hdr *trace;
@@ -1517,44 +1578,43 @@ bpf_ioam_trace_gob_data_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
 	trace = ioam6_trace_state->trace;
 
 	lockdep_assert_held(&ioam6_trace_state->bh_lock);
+
 	if (unlikely(!trace))
 		return -EINVAL;
 
-	gob = ioam6_trace_gob_hdr_get(trace);
+	gob = ioam6_trace_gob_hdr_pointer(skb, &trace);
 	if (unlikely(!gob))
 		return -EINVAL;
 
-	pdata_len = ioam6_trace_gob_len(gob) - sizeof(*gob);
+	pdata_len = ioam6_trace_gob_plen(gob);
 	if (pdata_len == 0)
 		/* GOB does not come with payload, it's only for signaling */
 		return -ENOMEM;
 
 	/* payload of the GOB */
-	pdata = trace->data + sizeof(*gob);
-	pend = (void *)pdata + pdata_len;
-
-	ptr = (void *)pdata + offset;
+	pdata = (void *)gob + sizeof(*gob);
+	pend = pdata + pdata_len;
+	ptr = pdata + offset;
 	if (ptr < pdata || ptr + from_len > pend)
 		/* out of bounds */
 		return -EFAULT;
 
+	trace_offset = ptroff_by_skb_data(skb, trace);
 	/* offset w.r.t. the GOB payload start with respect to skb->data */
-	gob_poffset = (void *)pdata - (void *)skb->data;
-	/* At least the gob_poffset must be after the ipv6hdr + the first two
-	 * fields of the HBH ...
-	 */
-	WARN_ON_ONCE(gob_poffset <= sizeof(struct ipv6hdr) +
-				    sizeof(struct ipv6_hopopt_hdr));
-
-	/* offset where the user want to write within the GOB payload evaluated
-	 * w.r.t. to the skb->data.
-	 */
+	gob_poffset = ptroff_by_skb_data(skb, pdata);
 	skb_data_poffset = gob_poffset + offset;
 
 	if (unlikely(bpf_try_make_writable(skb, skb_data_poffset + from_len)))
 		return -EFAULT;
 
-	/* gob_poffset don't change with bpf_try_make_writable */
+	/* bpf_try_make_writable() can change pointers, so reload them */
+	trace = __reload_ioam6_trace_hdr_pointer(skb, trace_offset);
+	if (unlikely(!trace))
+		return -EFAULT;
+
+	ioam6_trace_state->trace = trace;
+
+	/* gob_poffset don't change with bpf_try_make_writable() */
 	memcpy(skb->data + skb_data_poffset, from, from_len);
 	return 0;
 }
