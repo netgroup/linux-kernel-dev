@@ -1532,8 +1532,7 @@ static void __net_exit ioam6_net_exit(struct net *net)
 	kfree(nsdata);
 }
 
-
-static inline int __bpf_try_make_writable(struct sk_buff *skb,
+static int __bpf_try_make_writable(struct sk_buff *skb,
 					  unsigned int write_len)
 {
 #ifdef CONFIG_DEBUG_NET
@@ -1544,7 +1543,7 @@ static inline int __bpf_try_make_writable(struct sk_buff *skb,
 	return skb_ensure_writable(skb, write_len);
 }
 
-static inline int bpf_try_make_writable(struct sk_buff *skb,
+static int bpf_try_make_writable(struct sk_buff *skb,
 					unsigned int write_len)
 {
 	int err = __bpf_try_make_writable(skb, write_len);
