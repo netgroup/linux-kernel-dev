@@ -1573,8 +1573,8 @@ __reload_ioam6_trace_hdr_pointer(struct sk_buff *skb, int toff)
 __bpf_kfunc_start_defs();
 
 __bpf_kfunc int
-bpf_ioam_trace_gob_data_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
-				    const void *from, u32 from__sz)
+bpf_ioam6_trace_gob_data_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
+				     const void *from, u32 from__sz)
 {
 	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
 	struct ioam6_bpf_trace_state *ioam6_trace_state;
@@ -1632,18 +1632,18 @@ bpf_ioam_trace_gob_data_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
 
 __bpf_kfunc_end_defs();
 
-BTF_KFUNCS_START(ioam_kfunc_fset)
-BTF_ID_FLAGS(func, bpf_ioam_trace_gob_data_store_bytes)
-BTF_KFUNCS_END(ioam_kfunc_fset)
+BTF_KFUNCS_START(ioam6_kfunc_fset)
+BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_data_store_bytes)
+BTF_KFUNCS_END(ioam6_kfunc_fset)
 
 static struct pernet_operations ioam6_net_ops = {
 	.init = ioam6_net_init,
 	.exit = ioam6_net_exit,
 };
 
-static const struct btf_kfunc_id_set ioam_bpf_kfunc_fset = {
+static const struct btf_kfunc_id_set ioam6_bpf_kfunc_set = {
 	.owner = THIS_MODULE,
-	.set   = &ioam_kfunc_fset,
+	.set   = &ioam6_kfunc_fset,
 };
 
 int __init ioam6_init(void)
@@ -1657,7 +1657,7 @@ int __init ioam6_init(void)
 		goto out_unregister_pernet_subsys;
 
 	err = register_btf_kfunc_id_set(BPF_PROG_TYPE_IOAM6_GOB,
-					&ioam_bpf_kfunc_fset);
+					&ioam6_bpf_kfunc_set);
 	if (err)
 		goto out_unregister_genl;
 
