@@ -1089,14 +1089,26 @@ static int ioam6_event_put_trace(struct sk_buff *skb,
 				 struct ioam6_trace_hdr *trace,
 				 unsigned int len)
 {
+	struct ioam6_trace_gob_hdr *gob;
+	__u8 *trace_data = trace->data;
+	int gob_len = 0;
+
 	if (nla_put_u16(skb, IOAM6_EVENT_ATTR_TRACE_NAMESPACE,
 			be16_to_cpu(trace->namespace_id)) ||
 	    nla_put_u8(skb, IOAM6_EVENT_ATTR_TRACE_NODELEN, trace->nodelen) ||
 	    nla_put_u32(skb, IOAM6_EVENT_ATTR_TRACE_TYPE,
-			be32_to_cpu(trace->type_be32)) ||
-	    nla_put(skb, IOAM6_EVENT_ATTR_TRACE_DATA,
-		    len - sizeof(struct ioam6_trace_hdr) - trace->remlen * 4,
-		    ioam6_trace_data_get(trace) + trace->remlen * 4))
+			be32_to_cpu(trace->type_be32)))
+		return 1;
+
+	gob = ioam6_trace_gob_hdr_start(trace);
+	if (gob) {
+		gob_len = ioam6_trace_gob_len(gob);
+		trace_data = trace->data + gob_len;
+	}
+
+	if (nla_put(skb, IOAM6_EVENT_ATTR_TRACE_DATA,
+		    len - sizeof(struct ioam6_trace_hdr) - gob_len -
+		    trace->remlen * 4, trace_data + trace->remlen * 4))
 		return 1;
 
 	return 0;
