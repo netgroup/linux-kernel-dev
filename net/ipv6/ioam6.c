@@ -1582,11 +1582,11 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 {
 	struct ioam6_bpf_trace_state *ioam6_trace_state;
 	struct ioam6_trace_gob_hdr *gob;
-	void *p, *pstart, *ptr, *pend;
 	struct ioam6_trace_hdr *trace;
-	int toff, goff, skb_dataoff;
+	int toff, skb_dataoff;
 	int err = -EFAULT;
 	int gob_len;
+	void *p;
 
 	ioam6_trace_state = this_cpu_ptr(&ioam6_bpf_trace_states);
 	trace = ioam6_trace_state->trace;
@@ -1599,11 +1599,8 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 		return -EINVAL;
 	gob_len = ioam6_trace_gob_len(gob);
 
-	pstart = (void *)gob;
-	pend = pstart + gob_len;
-	ptr = pstart + offset;
 	/* don't need to check the lower bound as offset is always >= 0*/
-	if (ptr + usrlen > pend)
+	if (offset + usrlen > gob_len)
 		/* out of bounds */
 		return -EFAULT;
 
@@ -1611,8 +1608,7 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 	toff = ptroff_by_skb_data(skb, trace);
 
 	/* build the offset where the user wants to read/write */
-	goff = ptroff_by_skb_data(skb, gob);
-	skb_dataoff = goff + offset;
+	skb_dataoff = ptroff_by_skb_data(skb, gob) + offset;
 
 	switch (op) {
 	case BPF_IOAM6_GOB_OP_WRITE:
@@ -1638,7 +1634,7 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 			goto err_clear;
 
 		if (p != usrptr)
-			memcpy(usrptr, ptr, usrlen);
+			memcpy(usrptr, (void *)gob + offset, usrlen);
 
 		err = 0;
 		break;
