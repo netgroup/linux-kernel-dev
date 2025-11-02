@@ -1582,9 +1582,9 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 {
 	struct ioam6_bpf_trace_state *ioam6_trace_state;
 	struct ioam6_trace_gob_hdr *gob;
+	void *p, *pstart, *ptr, *pend;
 	struct ioam6_trace_hdr *trace;
 	int toff, goff, skb_dataoff;
-	void *pstart, *ptr, *pend;
 	int err = -EFAULT;
 	int gob_len;
 
@@ -1633,6 +1633,15 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 		err = 0;
 		break;
 	case BPF_IOAM6_GOB_OP_READ:
+		p = skb_header_pointer(skb, skb_dataoff, usrlen, usrptr);
+		if (unlikely(!p))
+			goto err_clear;
+
+		if (p != usrptr)
+			memcpy(usrptr, ptr, usrlen);
+
+		err = 0;
+		break;
 	case BPF_IOAM6_GOB_OP_UNSPEC:
 		/* fallthrough */
 	default:
@@ -1647,6 +1656,9 @@ reload_trace:
 
 	ioam6_trace_state->trace = trace;
 	return err;
+err_clear:
+	memset(usrptr, 0, usrlen);
+	goto reload_trace;
 }
 
 __bpf_kfunc_start_defs();
@@ -1661,10 +1673,21 @@ bpf_ioam6_trace_gob_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
 				      BPF_IOAM6_GOB_OP_WRITE);
 }
 
+__bpf_kfunc int
+bpf_ioam6_trace_gob_load_bytes(struct __sk_buff *skb_ctx, u32 offset,
+			       void *to, u32 to__sz)
+{
+	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
+
+	return __bpf_ioam6_gob_common(skb, offset, to, to__sz,
+				      BPF_IOAM6_GOB_OP_READ);
+}
+
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(ioam6_kfunc_fset)
 BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_store_bytes)
+BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_load_bytes);
 BTF_KFUNCS_END(ioam6_kfunc_fset)
 
 static struct pernet_operations ioam6_net_ops = {
