@@ -1570,70 +1570,101 @@ __reload_ioam6_trace_hdr_pointer(struct sk_buff *skb, int toff)
 	return (struct ioam6_trace_hdr *)(skb->data + toff);
 }
 
-__bpf_kfunc_start_defs();
+enum bpf_ioam6_gob_op {
+	BPF_IOAM6_GOB_OP_UNSPEC		= 0,
+	BPF_IOAM6_GOB_OP_READ,
+	BPF_IOAM6_GOB_OP_WRITE,
+};
 
-__bpf_kfunc int
-bpf_ioam6_trace_gob_data_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
-				     const void *from, u32 from__sz)
+static int
+__bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
+		       void *usrptr, u32 usrlen, enum bpf_ioam6_gob_op op)
 {
-	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
 	struct ioam6_bpf_trace_state *ioam6_trace_state;
-	int gob_poffset, skb_data_poffset, trace_offset;
 	struct ioam6_trace_gob_hdr *gob;
-	const int from_len = from__sz;
 	struct ioam6_trace_hdr *trace;
-	void *pend, *ptr, *pdata;
-	int pdata_len;
+	int toff, goff, skb_dataoff;
+	void *pstart, *ptr, *pend;
+	int err = -EFAULT;
+	int gob_len;
 
 	ioam6_trace_state = this_cpu_ptr(&ioam6_bpf_trace_states);
 	trace = ioam6_trace_state->trace;
-
 	lockdep_assert_held(&ioam6_trace_state->bh_lock);
-
 	if (unlikely(!trace))
 		return -EINVAL;
 
 	gob = ioam6_trace_gob_hdr_pointer(skb, &trace);
 	if (unlikely(!gob))
 		return -EINVAL;
+	gob_len = ioam6_trace_gob_len(gob);
 
-	pdata_len = ioam6_trace_gob_plen(gob);
-	if (pdata_len == 0)
-		/* GOB does not come with payload, it's only for signaling */
-		return -ENOMEM;
-
-	/* payload of the GOB */
-	pdata = (void *)gob + sizeof(*gob);
-	pend = pdata + pdata_len;
-	ptr = pdata + offset;
-	if (ptr < pdata || ptr + from_len > pend)
+	pstart = (void *)gob;
+	pend = pstart + gob_len;
+	ptr = pstart + offset;
+	/* don't need to check the lower bound as offset is always >= 0*/
+	if (ptr + usrlen > pend)
 		/* out of bounds */
 		return -EFAULT;
 
-	trace_offset = ptroff_by_skb_data(skb, trace);
-	/* offset w.r.t. the GOB payload start with respect to skb->data */
-	gob_poffset = ptroff_by_skb_data(skb, pdata);
-	skb_data_poffset = gob_poffset + offset;
+	/* save the trace offset to rebuild the pointer later */
+	toff = ptroff_by_skb_data(skb, trace);
 
-	if (unlikely(bpf_try_make_writable(skb, skb_data_poffset + from_len)))
-		return -EFAULT;
+	/* build the offset where the user wants to read/write */
+	goff = ptroff_by_skb_data(skb, gob);
+	skb_dataoff = goff + offset;
 
-	/* bpf_try_make_writable() can change pointers, so reload them */
-	trace = __reload_ioam6_trace_hdr_pointer(skb, trace_offset);
+	switch (op) {
+	case BPF_IOAM6_GOB_OP_WRITE:
+		switch (offset) {
+		case bpf_ctx_range_till(struct ioam6_trace_gob_hdr,
+					hbl.len, hbl.schema[2]):
+			/* at the moment the GOB header cannot be changed */
+			return -EFAULT;
+		default:
+			/* allowed to write in the payload */
+			break;
+		}
+		if (unlikely(bpf_try_make_writable(skb, skb_dataoff + usrlen)))
+			goto reload_trace;
+
+		memcpy(skb->data + skb_dataoff, usrptr, usrlen);
+
+		err = 0;
+		break;
+	case BPF_IOAM6_GOB_OP_READ:
+	case BPF_IOAM6_GOB_OP_UNSPEC:
+		/* fallthrough */
+	default:
+		return -EINVAL;
+	}
+
+reload_trace:
+	/* bpf_try_make_writable() et simila can change skb pointers */
+	trace = __reload_ioam6_trace_hdr_pointer(skb, toff);
 	if (unlikely(!trace))
-		return -EFAULT;
+		return -EBADF;
 
 	ioam6_trace_state->trace = trace;
+	return err;
+}
 
-	/* gob_poffset don't change with bpf_try_make_writable() */
-	memcpy(skb->data + skb_data_poffset, from, from_len);
-	return 0;
+__bpf_kfunc_start_defs();
+
+__bpf_kfunc int
+bpf_ioam6_trace_gob_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
+				const void *from, u32 from__sz)
+{
+	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
+
+	return __bpf_ioam6_gob_common(skb, offset, (void *)from, from__sz,
+				      BPF_IOAM6_GOB_OP_WRITE);
 }
 
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(ioam6_kfunc_fset)
-BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_data_store_bytes)
+BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_store_bytes)
 BTF_KFUNCS_END(ioam6_kfunc_fset)
 
 static struct pernet_operations ioam6_net_ops = {
