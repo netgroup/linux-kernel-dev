@@ -1613,8 +1613,7 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 	switch (op) {
 	case BPF_IOAM6_GOB_OP_WRITE:
 		switch (offset) {
-		case bpf_ctx_range_till(struct ioam6_trace_gob_hdr,
-					hbl.len, hbl.schema[2]):
+		case bpf_ctx_range(struct ioam6_trace_gob_hdr, hdr):
 			/* at the moment the GOB header cannot be changed */
 			return -EFAULT;
 		default:
