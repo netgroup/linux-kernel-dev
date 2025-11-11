@@ -86,11 +86,32 @@ static const struct nla_policy ioam6_iptunnel_policy[IOAM6_IPTUNNEL_MAX + 1] = {
 					sizeof(struct ioam6_trace_gob_hdr)),
 };
 
+static bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace)
+{
+	return trace->type.gob;
+}
+
 static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 {
 	u32 fields;
 
-	if (!trace->type_be32 || !trace->remlen ||
+	if (ioam6_trace_gob_enabled(trace)) {
+		/* when GOB is enabled, trace->remlen could be set to 0; it
+		 * means that we are not interested in writing into the node
+		 * data list but we rely only on the GOB extension.
+		 * Therefore, we force the overflow bit to 1 so that nodes can
+		 * skip the per-node data processing.
+		 *
+		 * Enforce the overflow bit (no matter if it has been set by
+		 * the userspace or not).
+		 */
+		trace->overflow = !trace->remlen;
+	} else if (!trace->remlen) {
+		/* GOB is not present, so the remlen must be > 0 */
+		return false;
+	}
+
+	if (!trace->type_be32 ||
 	    trace->remlen > IOAM6_TRACE_DATA_SIZE_MAX / 4 ||
 	    trace->type.bit12 | trace->type.bit13 | trace->type.bit14 |
 	    trace->type.bit15 | trace->type.bit16 | trace->type.bit17 |
@@ -186,7 +207,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 		return -EINVAL;
 	}
 
-	if (trace->type.gob) {
+	if (ioam6_trace_gob_enabled(trace)) {
 		u8 gob_paylen;
 
 		if (trace->type.gobver != 0x00) {
@@ -214,6 +235,8 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 	}
 
 	len_trace = trace->remlen * 4 + gob_len;
+	WARN_ON_ONCE(!len_trace);
+
 	len_aligned = ALIGN(len_trace, 8);
 	lwt = lwtunnel_state_alloc(sizeof(*ilwt) + len_aligned);
 	if (!lwt)
