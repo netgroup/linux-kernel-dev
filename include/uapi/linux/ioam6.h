@@ -136,8 +136,9 @@ struct ioam6_trace_hdr {
 	__u8	data[];
 } __attribute__((packed));
 
-#define IOAM6_TRACE_GOB_SCHEMA_ID_MASK	0x00ffffff
-#define IOAM6_TRACE_GOB_LEN_MASK	0xff000000
+#define IOAM6_TRACE_GOB_LEN_SHIFT	24
+#define IOAM6_TRACE_GOB_LEN_MASK	(U8_MAX << IOAM6_TRACE_GOB_LEN_SHIFT)
+#define IOAM6_TRACE_GOB_SCHEMA_ID_MASK	(U32_MAX & ~IOAM6_TRACE_GOB_LEN_MASK)
 struct ioam6_trace_gob_hdr {
 	union {
 		__be32 hdr;

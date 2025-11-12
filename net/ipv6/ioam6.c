@@ -57,7 +57,9 @@ static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 
 int ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)
 {
-	return (__be32_to_cpu(gob_hdr->hdr) >> 24) * 4;
+	__u32 hdr = __be32_to_cpu(gob_hdr->hdr);
+
+	return (hdr >> IOAM6_TRACE_GOB_LEN_SHIFT) * 4;
 }
 
 static int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
