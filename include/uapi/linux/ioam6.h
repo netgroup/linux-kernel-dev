@@ -146,7 +146,7 @@ struct ioam6_trace_gob_hdr {
 			__u8 schema[3];
 		} hbl;
 	};
-#define IOAM6_TRACE_GOB_DATA_SIZE_MAX 252
+#define IOAM6_TRACE_GOB_DATA_SIZE_MAX 240
 	__u8 data[];
 } __attribute__((packed));
 
