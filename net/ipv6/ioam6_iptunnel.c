@@ -226,7 +226,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 
 		gob_hdr = nla_data(tb[IOAM6_IPTUNNEL_TRACE_GOB]);
 
-		gob_paylen = gob_hdr->hbl.len * 4;
+		gob_paylen = ioam6_trace_gob_plen(gob_hdr);
 		if (gob_paylen > IOAM6_TRACE_GOB_DATA_SIZE_MAX) {
 			NL_SET_ERR_MSG(extack,
 				       "Global-Opaque Block length is not valid");
