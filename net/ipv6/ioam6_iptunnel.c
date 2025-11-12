@@ -150,6 +150,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 	int len_aligned, err;
 	u32 freq_k, freq_n;
 	int ioamh_optlen;
+	bool gob_enabled;
 	int gob_len = 0;
 	int len_trace;
 	int total_len;
@@ -207,31 +208,32 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 		return -EINVAL;
 	}
 
-	if (ioam6_trace_gob_enabled(trace)) {
-		u8 gob_paylen;
+	gob_enabled = ioam6_trace_gob_enabled(trace);
+	if (!!tb[IOAM6_IPTUNNEL_TRACE_GOB] != gob_enabled) {
+		NL_SET_ERR_MSG(extack,
+			       "invalid Global-Opaque Block configuration");
+		return -EINVAL;
+	}
+
+	if (gob_enabled) {
+		int gob_paylen;
 
 		if (trace->type.gobver != 0x00) {
-				NL_SET_ERR_MSG(extack,
-					       "Global-Opaque trace block version not supported");
-				return -EINVAL;
+			NL_SET_ERR_MSG(extack,
+				       "Global-Opaque Block version not supported");
+			return -EINVAL;
 		}
 
 		gob_hdr = nla_data(tb[IOAM6_IPTUNNEL_TRACE_GOB]);
-		if (!gob_hdr) {
+
+		gob_paylen = gob_hdr->hbl.len * 4;
+		if (gob_paylen > IOAM6_TRACE_GOB_DATA_SIZE_MAX) {
 			NL_SET_ERR_MSG(extack,
-				       "missing Global-Opaque trace block");
+				       "Global-Opaque Block length is not valid");
 			return -EINVAL;
 		}
 
-		/* GOB payload len is on the first 8 bits of the header */
-		gob_paylen = be32_to_cpu(gob_hdr->hdr) >> 24;
-		if (gob_paylen * 4 > IOAM6_TRACE_GOB_DATA_SIZE_MAX) {
-			NL_SET_ERR_MSG(extack,
-				       "Global-Opaque trace block length is not valid");
-			return -EINVAL;
-		}
-
-		gob_len = sizeof(*gob_hdr) + gob_paylen * 4;
+		gob_len = sizeof(*gob_hdr) + gob_paylen;
 	}
 
 	len_trace = trace->remlen * 4 + gob_len;
