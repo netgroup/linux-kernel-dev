@@ -29,7 +29,7 @@ DEFINE_PER_CPU(struct ioam6_bpf_trace_state, ioam6_bpf_trace_states) = {
 	.bh_lock	= INIT_LOCAL_LOCK(bh_lock),
 };
 
-bool is_ioam6_trace_gob_present(struct ioam6_trace_hdr *trace)
+bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace)
 {
 	return !!trace->type.gob;
 }
@@ -43,7 +43,7 @@ __ioam6_trace_gob_hdr_start_nocheck(struct ioam6_trace_hdr *trace)
 struct ioam6_trace_gob_hdr *
 ioam6_trace_gob_hdr_start(struct ioam6_trace_hdr *trace)
 {
-	return is_ioam6_trace_gob_present(trace) ?
+	return ioam6_trace_gob_enabled(trace) ?
 		__ioam6_trace_gob_hdr_start_nocheck(trace) : NULL;
 }
 

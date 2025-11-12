@@ -86,11 +86,6 @@ static const struct nla_policy ioam6_iptunnel_policy[IOAM6_IPTUNNEL_MAX + 1] = {
 					sizeof(struct ioam6_trace_gob_hdr)),
 };
 
-static bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace)
-{
-	return trace->type.gob;
-}
-
 static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 {
 	u32 fields;
