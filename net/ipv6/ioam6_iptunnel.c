@@ -88,9 +88,14 @@ static const struct nla_policy ioam6_iptunnel_policy[IOAM6_IPTUNNEL_MAX + 1] = {
 
 static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 {
-	u32 fields;
+	__be32 type_be32 = trace->type_be32;
+	u32 fields = be32_to_cpu(type_be32);
 
 	if (ioam6_trace_gob_enabled(trace)) {
+		/* remove the GOB fields from the fields */
+		bool fields_nogob = !!(fields & ~0x7U);
+		bool nonzero_remlen = !!trace->remlen;
+
 		/* when GOB is enabled, trace->remlen could be set to 0; it
 		 * means that we are not interested in writing into the node
 		 * data list but we rely only on the GOB extension.
@@ -100,14 +105,17 @@ static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 		 * Enforce the overflow bit (no matter if it has been set by
 		 * the userspace or not).
 		 */
-		trace->overflow = !trace->remlen;
-	} else if (!trace->remlen) {
-		/* GOB is not present, so the remlen must be > 0 */
+		trace->overflow = !nonzero_remlen;
+
+		if (fields_nogob ^ nonzero_remlen)
+			/* exactly one of fields_nogob,nonzero_remlen is set */
+			return false;
+	} else if (!trace->remlen || !type_be32)  {
+		/* GOB is not present, go ahead with default checks */
 		return false;
 	}
 
-	if (!trace->type_be32 ||
-	    trace->remlen > IOAM6_TRACE_DATA_SIZE_MAX / 4 ||
+	if (trace->remlen > IOAM6_TRACE_DATA_SIZE_MAX / 4 ||
 	    trace->type.bit12 | trace->type.bit13 | trace->type.bit14 |
 	    trace->type.bit15 | trace->type.bit16 | trace->type.bit17 |
 	    trace->type.bit18 | trace->type.bit19 | trace->type.bit20 |
@@ -115,8 +123,6 @@ static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 		return false;
 
 	trace->nodelen = 0;
-	fields = be32_to_cpu(trace->type_be32);
-
 	trace->nodelen += hweight32(fields & IOAM6_MASK_SHORT_FIELDS)
 				* (sizeof(__be32) / 4);
 	trace->nodelen += hweight32(fields & IOAM6_MASK_WIDE_FIELDS)
