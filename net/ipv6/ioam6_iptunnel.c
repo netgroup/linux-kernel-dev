@@ -350,16 +350,20 @@ static void ioam6_fill_gob_hdr(struct net *net, struct sk_buff *skb,
 			       struct ioam6_namespace *ns,
 			       struct ioam6_trace_gob_hdr *gob)
 {
-	__u8 hdr_len = (__u8)(__be32_to_cpu(gob->hdr) >> 24);
+	__u32 cpu_gob_hdr = be32_to_cpu(gob->hdr);
 	struct ioam6_gob_schema *gobsc;
 	__u32 schema_id;
 
 	gobsc = ns ? rcu_dereference(ns->gob_schema) : NULL;
-	schema_id = gobsc ? gobsc->id : IOAM6_DEFAULT_GOB_SCHEMA_ID;
+	schema_id = (gobsc ? gobsc->id : IOAM6_DEFAULT_GOB_SCHEMA_ID) &
+		    IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
+
+	/* update only the GOB Schema ID */
+	cpu_gob_hdr = (cpu_gob_hdr & ~IOAM6_TRACE_GOB_SCHEMA_ID_MASK) |
+		      schema_id;
 
 	/* update the packet GOB header */
-	gob->hdr = cpu_to_be32((hdr_len << 24) |
-		   (schema_id & IOAM6_TRACE_GOB_SCHEMA_ID_MASK));
+	gob->hdr = cpu_to_be32(cpu_gob_hdr);
 }
 
 /* called with rcu_read_lock() */
