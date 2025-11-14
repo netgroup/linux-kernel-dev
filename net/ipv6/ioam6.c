@@ -57,7 +57,7 @@ static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 
 int ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)
 {
-	__u32 hdr = __be32_to_cpu(gob_hdr->hdr);
+	__u32 hdr = be32_to_cpu(gob_hdr->hdr);
 
 	return (hdr >> IOAM6_TRACE_GOB_LEN_SHIFT) * 4;
 }
@@ -1425,7 +1425,7 @@ int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	 * with this namespace and compare it with the Schema ID carried by the
 	 * GOB Header.
 	 */
-	hdr_scid = __be32_to_cpu(gob->hdr) & IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
+	hdr_scid = be32_to_cpu(gob->hdr) & IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
 	if (hdr_scid != gobsc->id)
 		goto out;
 
