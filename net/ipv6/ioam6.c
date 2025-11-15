@@ -29,24 +29,6 @@ DEFINE_PER_CPU(struct ioam6_bpf_trace_state, ioam6_bpf_trace_states) = {
 	.bh_lock	= INIT_LOCAL_LOCK(bh_lock),
 };
 
-bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace)
-{
-	return !!trace->type.gob;
-}
-
-static struct ioam6_trace_gob_hdr *
-__ioam6_trace_gob_hdr_start_nocheck(struct ioam6_trace_hdr *trace)
-{
-	return (struct ioam6_trace_gob_hdr *)trace->data;
-}
-
-struct ioam6_trace_gob_hdr *
-ioam6_trace_gob_hdr_start(struct ioam6_trace_hdr *trace)
-{
-	return ioam6_trace_gob_enabled(trace) ?
-		__ioam6_trace_gob_hdr_start_nocheck(trace) : NULL;
-}
-
 static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 {
 	int off = ptr - (void *)skb->data;
@@ -55,45 +37,42 @@ static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 	return off;
 }
 
-int ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)
-{
-	__u32 hdr = be32_to_cpu(gob_hdr->hdr);
-
-	return (hdr >> IOAM6_TRACE_GOB_LEN_SHIFT) * 4;
-}
-
 static int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
 {
 	return sizeof(*gob_hdr) + ioam6_trace_gob_plen(gob_hdr);
+}
+
+/* call only when we are sure that GOB header is present */
+static struct ioam6_trace_gob_hdr *
+__ioam6_trace_gob_hdr_pointer(struct sk_buff *skb,
+			    struct ioam6_trace_hdr **trace)
+{
+	struct ioam6_trace_hdr *th;
+	int trace_off, len;
+
+	trace_off = ptroff_by_skb_data(skb, *trace);
+	len = sizeof(*th) + sizeof(struct ioam6_trace_gob_hdr);
+
+	/* we read the ioam6_trace_hdr + ioam6_gob_hdr */
+	if (unlikely(!pskb_may_pull(skb, trace_off + len)))
+		return NULL;
+
+	th = (struct ioam6_trace_hdr *)(skb->data + trace_off);
+	/* we update the trace pointer for being valid in the caller.
+	 * At the same time we can be sure that gob header is present and
+	 * readable.
+	 */
+	*trace = th;
+
+	return  __ioam6_trace_gob_hdr_start_nocheck(th);
 }
 
 static struct ioam6_trace_gob_hdr *
 ioam6_trace_gob_hdr_pointer(struct sk_buff *skb,
 			    struct ioam6_trace_hdr **trace)
 {
-	struct ioam6_trace_gob_hdr *gob;
-	struct ioam6_trace_hdr *th;
-	int trace_off, len;
-
-	if (!ioam6_trace_gob_hdr_start(*trace))
-		return NULL;
-
-	trace_off = ptroff_by_skb_data(skb, *trace);
-	len = sizeof(*th) + sizeof(*gob);
-	/* we read the ioam6_trace_hdr + ioam6_gob_hdr */
-	if (unlikely(!pskb_may_pull(skb, trace_off + len)))
-		return NULL;
-
-	th = (struct ioam6_trace_hdr *)(skb->data + trace_off);
-
-	/* we update the trace pointer for being valid in the caller.
-	 * At the same time we can be sure that gob header is present and
-	 * readable.
-	 */
-	gob = __ioam6_trace_gob_hdr_start_nocheck(th);
-	*trace = th;
-
-	return gob;
+	return ioam6_trace_gob_enabled(*trace) ?
+		__ioam6_trace_gob_hdr_pointer(skb, trace) : NULL;
 }
 
 static __u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
@@ -1409,10 +1388,10 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
 	}
 }
 
-/* called with rcu_read_lock() */
+/* called with rcu_read_lock(); assume that GOB header is present */
 static int
-ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
-			  struct ioam6_trace_hdr *trace)
+__ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
+			    struct ioam6_trace_hdr *trace)
 {
 	struct ioam6_bpf_trace_state *ioam6_state;
 	struct ioam6_trace_gob_hdr *gob;
@@ -1420,8 +1399,8 @@ ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	int ret, err = 0;
 	__u32 hdr_scid;
 
-	gob = ioam6_trace_gob_hdr_pointer(skb, &trace);
-	if (!gob)
+	gob = __ioam6_trace_gob_hdr_pointer(skb, &trace);
+	if (unlikely(!gob))
 		goto out;
 
 	gobsc = rcu_dereference(ns->gob_schema);
@@ -1502,7 +1481,8 @@ int ioam6_fill_trace_data(struct sk_buff *skb,
 	trace->remlen -= trace->nodelen + sclen;
 
 out:
-	return ioam6_fill_gob_trace_data(skb, ns, trace);
+	return ioam6_trace_gob_enabled(trace) ?
+		__ioam6_fill_gob_trace_data(skb, ns, trace): 0;
 }
 
 static int __net_init ioam6_net_init(struct net *net)

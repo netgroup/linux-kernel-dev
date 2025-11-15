@@ -80,10 +80,30 @@ static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
 #endif
 }
 
-bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace);
-struct ioam6_trace_gob_hdr *
-ioam6_trace_gob_hdr_start(struct ioam6_trace_hdr *trace);
-int ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob);
+static inline bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace)
+{
+	return !!trace->type.gob;
+}
+
+static inline struct ioam6_trace_gob_hdr *
+__ioam6_trace_gob_hdr_start_nocheck(struct ioam6_trace_hdr *trace)
+{
+	return (struct ioam6_trace_gob_hdr *)trace->data;
+}
+
+static inline struct ioam6_trace_gob_hdr *
+ioam6_trace_gob_hdr_start(struct ioam6_trace_hdr *trace)
+{
+	return ioam6_trace_gob_enabled(trace) ?
+		__ioam6_trace_gob_hdr_start_nocheck(trace) : NULL;
+}
+
+static inline int ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)
+{
+	__u32 hdr = be32_to_cpu(gob_hdr->hdr);
+
+	return (hdr >> IOAM6_TRACE_GOB_LEN_SHIFT) * 4;
+}
 
 struct ioam6_namespace *ioam6_namespace(struct net *net, __be16 id);
 int ioam6_fill_trace_data(struct sk_buff *skb,
