@@ -366,21 +366,17 @@ static void ioam6_fill_gob_hdr(struct net *net, struct sk_buff *skb,
 	gob->hdr = cpu_to_be32(cpu_gob_hdr);
 }
 
-/* called with rcu_read_lock() */
-static int ioam6_fill_gob_schema(struct net *net, struct sk_buff *skb,
-				 struct ioam6_namespace *ns,
-				 struct ioam6_trace_hdr *trace)
+static void ioam6_may_fill_gob_hdr(struct net *net, struct sk_buff *skb,
+				   struct ioam6_namespace *ns,
+				   struct ioam6_trace_hdr *trace)
 {
 	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_start(trace);
 
 	if (!gob)
-		return 0;
+		return;
 
-	/* the GOB header is present, let's set it */
+	/* note that gob hdr is filled no matter of the ns existence */
 	ioam6_fill_gob_hdr(net, skb, ns, gob);
-
-	/* ignore the gob trace filling for unknown namespace */
-	return ns ? ioam6_fill_gob_trace_data(skb, ns, trace) : 0;
 }
 
 static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
@@ -393,10 +389,10 @@ static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 					   + sizeof(struct ioam6_hdr));
 
 	ns = ioam6_namespace(net, trace->namespace_id);
-	if (ns)
-		ioam6_fill_trace_data(skb, ns, trace, false);
 
-	return ioam6_fill_gob_schema(net, skb, ns, trace);
+	ioam6_may_fill_gob_hdr(net, skb, ns, trace);
+
+	return ns ? ioam6_fill_trace_data(skb, ns, trace, false) : 0;
 }
 
 static int ioam6_do_inline(struct net *net, struct sk_buff *skb,

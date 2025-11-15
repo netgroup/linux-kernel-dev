@@ -83,8 +83,6 @@ static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
 bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace);
 struct ioam6_trace_gob_hdr *
 ioam6_trace_gob_hdr_start(struct ioam6_trace_hdr *trace);
-int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
-			      struct ioam6_trace_hdr *trace);
 int ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob);
 
 struct ioam6_namespace *ioam6_namespace(struct net *net, __be16 id);

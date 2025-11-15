@@ -1404,8 +1404,9 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
 }
 
 /* called with rcu_read_lock() */
-int ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
-			      struct ioam6_trace_hdr *trace)
+static int
+ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
+			  struct ioam6_trace_hdr *trace)
 {
 	struct ioam6_bpf_trace_state *ioam6_state;
 	struct ioam6_trace_gob_hdr *gob;
