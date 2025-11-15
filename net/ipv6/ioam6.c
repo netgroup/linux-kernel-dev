@@ -309,6 +309,7 @@ out_unlock:
 static int ioam6_genl_delns(struct sk_buff *skb, struct genl_info *info)
 {
 	struct ioam6_pernet_data *nsdata;
+	struct ioam6_gob_schema *gobsc;
 	struct ioam6_namespace *ns;
 	struct ioam6_schema *sc;
 	__be16 id;
@@ -331,6 +332,9 @@ static int ioam6_genl_delns(struct sk_buff *skb, struct genl_info *info)
 	sc = rcu_dereference_protected(ns->schema,
 				       lockdep_is_held(&nsdata->lock));
 
+	gobsc = rcu_dereference_protected(ns->gob_schema,
+					  lockdep_is_held(&nsdata->lock));
+
 	err = rhashtable_remove_fast(&nsdata->namespaces, &ns->head,
 				     rht_ns_params);
 	if (err)
@@ -338,6 +342,8 @@ static int ioam6_genl_delns(struct sk_buff *skb, struct genl_info *info)
 
 	if (sc)
 		rcu_assign_pointer(sc->ns, NULL);
+	if (gobsc)
+		rcu_assign_pointer(gobsc->ns, NULL);
 
 	ioam6_ns_release(ns);
 
