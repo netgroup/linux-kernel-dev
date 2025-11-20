@@ -34,8 +34,6 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_SK_MSG, sk_msg,
 	      struct sk_msg_md, struct sk_msg)
 BPF_PROG_TYPE(BPF_PROG_TYPE_FLOW_DISSECTOR, flow_dissector,
 	      struct __sk_buff, struct bpf_flow_dissector)
-BPF_PROG_TYPE(BPF_PROG_TYPE_IOAM6_GOB, ioam6_gob,
-	      struct __sk_buff, struct sk_buff)
 #endif
 #ifdef CONFIG_BPF_EVENTS
 BPF_PROG_TYPE(BPF_PROG_TYPE_KPROBE, kprobe,
@@ -85,6 +83,9 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_SYSCALL, bpf_syscall,
 BPF_PROG_TYPE(BPF_PROG_TYPE_NETFILTER, netfilter,
 	      struct bpf_nf_ctx, struct bpf_nf_ctx)
 #endif
+
+BPF_PROG_TYPE(BPF_PROG_TYPE_IOAM6_GOB, ioam6_gob,
+	      struct __sk_buff, struct sk_buff)
 
 BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
 BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_ARRAY, percpu_array_map_ops)
