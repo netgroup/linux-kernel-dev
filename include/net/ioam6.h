@@ -80,6 +80,14 @@ static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
 #endif
 }
 
+/* bpf context for BPF_PROG_TYPE_IOAM6_GOB */
+struct bpf_ioam6_trace_gob_ctx {
+	__u32 len;
+	__u32 schema;
+
+	struct sk_buff *skb;
+};
+
 static inline bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace)
 {
 	return !!trace->type.gob;
@@ -103,6 +111,13 @@ static inline u32 ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)
 	u32 hdr = be32_to_cpu(gob_hdr->hdr);
 
 	return (hdr >> IOAM6_TRACE_GOB_LEN_SHIFT) * 4;
+}
+
+static inline u32 ioam6_trace_gob_schema(struct ioam6_trace_gob_hdr *gob_hdr)
+{
+	u32 hdr = be32_to_cpu(gob_hdr->hdr);
+
+	return hdr & IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
 }
 
 struct ioam6_namespace *ioam6_namespace(struct net *net, __be16 id);

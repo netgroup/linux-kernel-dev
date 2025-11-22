@@ -29,6 +29,7 @@
 #include <linux/overflow.h>
 
 #include <net/netfilter/nf_bpf_link.h>
+#include <net/ioam6.h>
 
 #include <net/sock.h>
 #include <net/xdp.h>

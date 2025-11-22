@@ -1394,10 +1394,12 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 			    struct ioam6_trace_hdr *trace)
 {
 	struct ioam6_bpf_trace_state *ioam6_state;
+	struct bpf_ioam6_trace_gob_ctx ctx;
 	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_gob_schema *gobsc;
+	struct bpf_prog *prog;
 	int ret, err = 0;
-	__u32 hdr_scid;
+	u32 hdr_scid;
 
 	gob = __ioam6_trace_gob_hdr_pointer(skb, &trace);
 	if (unlikely(!gob))
@@ -1425,7 +1427,15 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	ioam6_state->trace = trace;
 
 	bpf_compute_data_pointers(skb);
-	ret = bpf_prog_run_save_cb(gobsc->bpf.prog, skb);
+	prog = gobsc->bpf.prog;
+
+	/* prepare the bpf context */
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.len = ioam6_trace_gob_len(gob);
+	ctx.schema = ioam6_trace_gob_schema(gob);
+	ctx.skb = skb;
+
+	ret = bpf_prog_run_pin_on_cpu(prog, &ctx);
 	switch (ret) {
 	case BPF_OK:
 		break;

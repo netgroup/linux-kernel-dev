@@ -85,6 +85,7 @@
 #include <linux/un.h>
 #include <net/xdp_sock_drv.h>
 #include <net/inet_dscp.h>
+#include <net/ioam6.h>
 
 #include "dev.h"
 
@@ -8759,7 +8760,7 @@ ioam6_gob_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
 	switch (func_id) {
 	default:
-		return lwt_out_func_proto(func_id, prog);
+		return bpf_base_func_proto(func_id, prog);
 	}
 }
 
@@ -8940,13 +8941,57 @@ static bool lwt_is_valid_access(int off, int size,
 	return bpf_skb_is_valid_access(off, size, type, prog, info);
 }
 
+static bool
+ioam6_gob_ctx_ptr_to_btf_id(struct bpf_insn_access_aux *info, const char *name)
+{
+	struct btf *btf;
+	s32 type_id;
+
+	btf = bpf_get_btf_vmlinux();
+	if (IS_ERR_OR_NULL(btf))
+		return false;
+
+	type_id = btf_find_by_name_kind(btf, name, BTF_KIND_STRUCT);
+	if (WARN_ON_ONCE(type_id < 0))
+		return false;
+
+	info->btf = btf;
+	info->btf_id = type_id;
+	info->reg_type = PTR_TO_BTF_ID | PTR_TRUSTED;
+	return true;
+}
 
 static bool ioam6_gob_is_valid_access(int off, int size,
 				      enum bpf_access_type type,
 				      const struct bpf_prog *prog,
 				      struct bpf_insn_access_aux *info)
 {
-	return lwt_is_valid_access(off, size, type, prog, info);
+	if (off < 0 || off >= sizeof(struct bpf_ioam6_trace_gob_ctx))
+		return false;
+
+	if (off % size != 0)
+		return false;
+
+	if (type == BPF_WRITE)
+		return false;
+
+	switch (off) {
+	case bpf_ctx_range(struct bpf_ioam6_trace_gob_ctx, len):
+	case bpf_ctx_range(struct bpf_ioam6_trace_gob_ctx, schema):
+		if (size != sizeof(__u32))
+			return false;
+
+		return true;
+	case bpf_ctx_range(struct bpf_ioam6_trace_gob_ctx, skb):
+		if (size != sizeof_field(struct bpf_ioam6_trace_gob_ctx, skb))
+			return false;
+
+		return ioam6_gob_ctx_ptr_to_btf_id(info, "sk_buff");
+	default:
+		return false;
+	}
+
+	return false;
 }
 
 /* Attach type specific accesses */
@@ -11291,7 +11336,6 @@ const struct bpf_prog_ops lwt_seg6local_prog_ops = {
 const struct bpf_verifier_ops ioam6_gob_verifier_ops = {
 	.get_func_proto		= ioam6_gob_func_proto,
 	.is_valid_access	= ioam6_gob_is_valid_access,
-	.convert_ctx_access	= bpf_convert_ctx_access,
 };
 
 const struct bpf_prog_ops ioam6_gob_prog_ops = {

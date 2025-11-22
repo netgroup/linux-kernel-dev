@@ -6833,7 +6833,7 @@ static struct {
 	{ BPF_PROG_TYPE_SOCK_OPS,                "bpf_sock_ops" },
 	{ BPF_PROG_TYPE_SOCKET_FILTER,           "__sk_buff" },
 	{ BPF_PROG_TYPE_XDP,                     "xdp_md" },
-	{ BPF_PROG_TYPE_IOAM6_GOB,		"__sk_buff" },
+	{ BPF_PROG_TYPE_IOAM6_GOB,		 "bpf_ioam6_trace_gob_ctx" },
 	/* all other program types don't have "named" context structs */
 };
 
