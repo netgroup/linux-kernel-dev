@@ -4338,6 +4338,8 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 	case BPF_NETKIT_PRIMARY:
 	case BPF_NETKIT_PEER:
 		return BPF_PROG_TYPE_SCHED_CLS;
+	case BPF_IOAM6_GOB:
+		return BPF_PROG_TYPE_IOAM6_GOB;
 	default:
 		return BPF_PROG_TYPE_UNSPEC;
 	}
