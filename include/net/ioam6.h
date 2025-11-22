@@ -98,9 +98,9 @@ ioam6_trace_gob_hdr_start(struct ioam6_trace_hdr *trace)
 		__ioam6_trace_gob_hdr_start_nocheck(trace) : NULL;
 }
 
-static inline int ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)
+static inline u32 ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)
 {
-	__u32 hdr = be32_to_cpu(gob_hdr->hdr);
+	u32 hdr = be32_to_cpu(gob_hdr->hdr);
 
 	return (hdr >> IOAM6_TRACE_GOB_LEN_SHIFT) * 4;
 }
