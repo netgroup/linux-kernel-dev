@@ -1448,7 +1448,7 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	 * with this namespace and compare it with the Schema ID carried by the
 	 * GOB Header.
 	 */
-	hdr_scid = be32_to_cpu(gob->hdr) & IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
+	hdr_scid = ioam6_trace_gob_schema(gob);
 	if (hdr_scid != gobsc->id)
 		return 0;
 
