@@ -42,37 +42,17 @@ static int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
 	return sizeof(*gob_hdr) + ioam6_trace_gob_plen(gob_hdr);
 }
 
-/* call only when we are sure that GOB header is present */
 static struct ioam6_trace_gob_hdr *
-__ioam6_trace_gob_hdr_pointer(struct sk_buff *skb,
-			    struct ioam6_trace_hdr **trace)
+__ioam6_trace_gob_hdr_pointer_if_linear(struct sk_buff *skb,
+					struct ioam6_trace_hdr *trace,
+					int offset)
 {
-	struct ioam6_trace_hdr *th;
-	int trace_off, len;
-
-	trace_off = ptroff_by_skb_data(skb, *trace);
-	len = sizeof(*th) + sizeof(struct ioam6_trace_gob_hdr);
-
-	/* we read the ioam6_trace_hdr + ioam6_gob_hdr */
-	if (unlikely(!pskb_may_pull(skb, trace_off + len)))
-		return NULL;
-
-	th = (struct ioam6_trace_hdr *)(skb->data + trace_off);
-	/* we update the trace pointer for being valid in the caller.
-	 * At the same time we can be sure that gob header is present and
-	 * readable.
+	/* when GOB is present, it always starts at the end of the trace
+	 * header, before the Node-data list.
 	 */
-	*trace = th;
+	int gob_off = ptroff_by_skb_data(skb, trace->data);
 
-	return  __ioam6_trace_gob_hdr_start_nocheck(th);
-}
-
-static struct ioam6_trace_gob_hdr *
-ioam6_trace_gob_hdr_pointer(struct sk_buff *skb,
-			    struct ioam6_trace_hdr **trace)
-{
-	return ioam6_trace_gob_enabled(*trace) ?
-		__ioam6_trace_gob_hdr_pointer(skb, trace) : NULL;
+	return skb_pointer_if_linear(skb, gob_off, offset);
 }
 
 static __u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
@@ -1438,22 +1418,31 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 			    struct ioam6_trace_hdr *trace)
 {
 	struct ioam6_bpf_trace_state *ioam6_state;
-	struct ioam6_trace_gob_hdr *gob;
+	struct ioam6_trace_gob_hdr *gob, *p;
 	struct ioam6_gob_schema *gobsc;
-	u32 hdr_scid;
-	int err = 0;
+	u32 hdr_scid, gob_len;
+	int ret;
 
-	/* XXX: the whole HBH has been check if is writable, e.g., is cloned if
-	 * needed or expanded as well. So updating the ptr trace could be
-	 * avoided here since is not supposed to be invalidated...
+	/* the IOAM has been check if is writable, e.g., is cloned if
+	 * needed or expanded as well, see@ ipv6_hop_ioam().
+	 * Thus, the GOB region must be in the linear part of the skb's data,
+	 * fail otherwise.
 	 */
-	gob = __ioam6_trace_gob_hdr_pointer(skb, &trace);
-	if (unlikely(!gob))
-		goto out;
+	gob = __ioam6_trace_gob_hdr_start_nocheck(trace);
+	gob_len = ioam6_trace_gob_len(gob);
+
+	p = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, gob_len);
+	if (unlikely(gob_len > IOAM6_TRACE_GOB_DATA_SIZE_MAX || !p)) {
+		WARN_ON_ONCE(1);
+		/* something very weird happened, so by returning -EINVAL we
+		 * drop the packet.
+		 */
+		return -EINVAL;
+	}
 
 	gobsc = rcu_dereference(ns->gob_schema);
 	if (!gobsc)
-		goto out;
+		return 0;
 
 	/* GOB Schema is available, let's retrieve the GOB Schema ID associated
 	 * with this namespace and compare it with the Schema ID carried by the
@@ -1461,22 +1450,21 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	 */
 	hdr_scid = be32_to_cpu(gob->hdr) & IOAM6_TRACE_GOB_SCHEMA_ID_MASK;
 	if (hdr_scid != gobsc->id)
-		goto out;
+		return 0;
 
 	/* The GOB Header carries the same Schema ID active on the current node
 	 * (due to the binding to the current namespace).
 	 */
 
 	local_lock_nested_bh(&ioam6_bpf_trace_states.bh_lock);
+
 	ioam6_state = this_cpu_ptr(&ioam6_bpf_trace_states);
-	/* ioam6_trace_gob_hdr_pointer() takes care of updating trace pointer */
 	ioam6_state->trace = trace;
 
-	err = ioam6_gob_run_prog(skb, gob, gobsc->bpf.prog);
+	ret = ioam6_gob_run_prog(skb, gob, gobsc->bpf.prog);
 
 	local_unlock_nested_bh(&ioam6_bpf_trace_states.bh_lock);
-out:
-	return err;
+	return ret;
 }
 
 /* called with rcu_read_lock() */
@@ -1569,32 +1557,6 @@ static void __net_exit ioam6_net_exit(struct net *net)
 	kfree(nsdata);
 }
 
-static int __bpf_try_make_writable(struct sk_buff *skb,
-					  unsigned int write_len)
-{
-#ifdef CONFIG_DEBUG_NET
-	/* Avoid a splat in pskb_may_pull_reason() */
-	if (write_len > INT_MAX)
-		return -EINVAL;
-#endif
-	return skb_ensure_writable(skb, write_len);
-}
-
-static int bpf_try_make_writable(struct sk_buff *skb,
-					unsigned int write_len)
-{
-	int err = __bpf_try_make_writable(skb, write_len);
-
-	bpf_compute_data_pointers(skb);
-	return err;
-}
-
-static struct ioam6_trace_hdr *
-__reload_ioam6_trace_hdr_pointer(struct sk_buff *skb, int toff)
-{
-	return (struct ioam6_trace_hdr *)(skb->data + toff);
-}
-
 enum bpf_ioam6_gob_op {
 	BPF_IOAM6_GOB_OP_UNSPEC		= 0,
 	BPF_IOAM6_GOB_OP_READ,
@@ -1608,20 +1570,21 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 	struct ioam6_bpf_trace_state *ioam6_trace_state;
 	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_trace_hdr *trace;
-	int toff, skb_dataoff;
-	int err = -EFAULT;
+	int skb_dataoff, gob_off;
 	int gob_len;
-	void *p;
 
 	ioam6_trace_state = this_cpu_ptr(&ioam6_bpf_trace_states);
 	trace = ioam6_trace_state->trace;
 	lockdep_assert_held(&ioam6_trace_state->bh_lock);
-	if (unlikely(!trace))
-		return -EINVAL;
 
-	gob = ioam6_trace_gob_hdr_pointer(skb, &trace);
-	if (unlikely(!gob))
+	/* trace is set in the GOB eBPF program runner */
+	if (unlikely(!trace || !ioam6_trace_gob_enabled(trace))) {
+		WARN_ON_ONCE(1);
 		return -EINVAL;
+	}
+
+	gob = __ioam6_trace_gob_hdr_start_nocheck(trace);
+	gob_off = ptroff_by_skb_data(skb, gob);
 	gob_len = ioam6_trace_gob_len(gob);
 
 	/* don't need to check the lower bound as offset is always >= 0*/
@@ -1629,11 +1592,8 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 		/* out of bounds */
 		return -EFAULT;
 
-	/* save the trace offset to rebuild the pointer later */
-	toff = ptroff_by_skb_data(skb, trace);
-
 	/* build the offset where the user wants to read/write */
-	skb_dataoff = ptroff_by_skb_data(skb, gob) + offset;
+	skb_dataoff = gob_off + offset;
 
 	switch (op) {
 	case BPF_IOAM6_GOB_OP_WRITE:
@@ -1645,40 +1605,21 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 			/* allowed to write in the payload */
 			break;
 		}
-		if (unlikely(bpf_try_make_writable(skb, skb_dataoff + usrlen)))
-			goto reload_trace;
 
+		/* we already checked that the GOB is in the linear skb's data
+		 * part, as well as the packet is already cloned/expanded.
+		 */
 		memcpy(skb->data + skb_dataoff, usrptr, usrlen);
-
-		err = 0;
-		break;
+		return 0;
 	case BPF_IOAM6_GOB_OP_READ:
-		p = skb_header_pointer(skb, skb_dataoff, usrlen, usrptr);
-		if (unlikely(!p))
-			goto err_clear;
-
-		if (p != usrptr)
-			memcpy(usrptr, (void *)gob + offset, usrlen);
-
-		err = 0;
-		break;
+		/* the same as write for what concerns the skb linearity */
+		memcpy(usrptr, (void *)gob + offset, usrlen);
+		return 0;
 	case BPF_IOAM6_GOB_OP_UNSPEC:
 		/* fallthrough */
 	default:
 		return -EINVAL;
 	}
-
-reload_trace:
-	/* bpf_try_make_writable() et simila can change skb pointers */
-	trace = __reload_ioam6_trace_hdr_pointer(skb, toff);
-	if (unlikely(!trace))
-		return -EBADF;
-
-	ioam6_trace_state->trace = trace;
-	return err;
-err_clear:
-	memset(usrptr, 0, usrlen);
-	goto reload_trace;
 }
 
 __bpf_kfunc_start_defs();
