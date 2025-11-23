@@ -1388,19 +1388,65 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
 	}
 }
 
+static int
+ioam6_gob_run_prog(struct sk_buff *skb, struct ioam6_trace_gob_hdr *gob,
+		   struct bpf_prog *prog)
+{
+	u32 gob_schema = ioam6_trace_gob_schema(gob);
+	u32 gob_plen = ioam6_trace_gob_plen(gob);
+	u32 gob_len = sizeof(*gob) + gob_plen;
+	struct bpf_ioam6_trace_gob_ctx ctx;
+	int ret, err = 0;
+
+	/* initialize the bpf prog context */
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.len = gob_len;
+	ctx.schema = gob_schema;
+	ctx.data = (void *)gob->data;
+	ctx.data_end = ctx.data + gob_plen;
+	ctx.skb = skb;
+
+	/* XXX: is it still needed? and if yes, who save the skb->cb now? */
+	bpf_compute_data_pointers(skb);
+
+	/* Note that a IOAM6_GOB eBPF program cannot change the size of the
+	 * packet, and the ioam6 code already checked if the whole HBH was
+	 * writable or not. So in theory, we don't expect to clone or expand
+	 * the packet again, and thus change the skb pointers.
+	 * Moreover, this eBPF program does not allow to use helpers who mangle
+	 * the packet in a way that pointers to the skb must be invalidated.
+	 */
+	ret = bpf_prog_run_pin_on_cpu(prog, &ctx);
+	switch (ret) {
+	case BPF_OK:
+		break;
+	case BPF_DROP:
+		err = -EINVAL;
+		break;
+	default:
+		pr_warn_once("bpf-ioam6-gob: Illegal return value %d\n", ret);
+		err = -EFAULT;
+		break;
+	}
+
+	return err;
+}
+
 /* called with rcu_read_lock(); assume that GOB header is present */
 static int
 __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 			    struct ioam6_trace_hdr *trace)
 {
 	struct ioam6_bpf_trace_state *ioam6_state;
-	struct bpf_ioam6_trace_gob_ctx ctx;
 	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_gob_schema *gobsc;
-	struct bpf_prog *prog;
-	int ret, err = 0;
 	u32 hdr_scid;
+	int err = 0;
 
+	/* XXX: the whole HBH has been check if is writable, e.g., is cloned if
+	 * needed or expanded as well. So updating the ptr trace could be
+	 * avoided here since is not supposed to be invalidated...
+	 */
 	gob = __ioam6_trace_gob_hdr_pointer(skb, &trace);
 	if (unlikely(!gob))
 		goto out;
@@ -1426,27 +1472,7 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	/* ioam6_trace_gob_hdr_pointer() takes care of updating trace pointer */
 	ioam6_state->trace = trace;
 
-	bpf_compute_data_pointers(skb);
-	prog = gobsc->bpf.prog;
-
-	/* prepare the bpf context */
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.len = ioam6_trace_gob_len(gob);
-	ctx.schema = ioam6_trace_gob_schema(gob);
-	ctx.skb = skb;
-
-	ret = bpf_prog_run_pin_on_cpu(prog, &ctx);
-	switch (ret) {
-	case BPF_OK:
-		break;
-	case BPF_DROP:
-		err = -EINVAL;
-		break;
-	default:
-		pr_warn_once("bpf-ioam6-gob: Illegal return value %d\n", ret);
-		err = -EFAULT;
-		break;
-	}
+	err = ioam6_gob_run_prog(skb, gob, gobsc->bpf.prog);
 
 	local_unlock_nested_bh(&ioam6_bpf_trace_states.bh_lock);
 out:

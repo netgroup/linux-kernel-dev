@@ -84,6 +84,8 @@ static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
 struct bpf_ioam6_trace_gob_ctx {
 	__u32 len;
 	__u32 schema;
+	void *data;
+	void *data_end;
 
 	struct sk_buff *skb;
 };

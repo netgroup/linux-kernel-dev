@@ -8982,6 +8982,18 @@ static bool ioam6_gob_is_valid_access(int off, int size,
 			return false;
 
 		return true;
+	case bpf_ctx_range_ptr(struct bpf_ioam6_trace_gob_ctx, data):
+		if (size != sizeof(__u64))
+			return false;
+
+		info->reg_type = PTR_TO_PACKET;
+		return true;
+	case bpf_ctx_range_ptr(struct bpf_ioam6_trace_gob_ctx, data_end):
+		if (size != sizeof(__u64))
+			return false;
+
+		info->reg_type = PTR_TO_PACKET_END;
+		return true;
 	case bpf_ctx_range(struct bpf_ioam6_trace_gob_ctx, skb):
 		if (size != sizeof_field(struct bpf_ioam6_trace_gob_ctx, skb))
 			return false;
