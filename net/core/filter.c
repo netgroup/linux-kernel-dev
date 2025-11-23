@@ -11348,6 +11348,18 @@ const struct bpf_prog_ops lwt_seg6local_prog_ops = {
 const struct bpf_verifier_ops ioam6_gob_verifier_ops = {
 	.get_func_proto		= ioam6_gob_func_proto,
 	.is_valid_access	= ioam6_gob_is_valid_access,
+	/* The GOB payload resides inside the IOAM payload, which the HBH/IOAM
+	 * infrastructure has already prepared (cloned or expanded) before the
+	 * IOAM6 code and any eBPF program are invoked.
+	 * Because the surrounding IOAM payload is already writable, accessing
+	 * the GOB data directly (via ctx->data / ctx->data_end) or through the
+	 * ioam6_gob helper functions should never invalidate skb pointers.
+	 * The GOB area itself cannot grow or shrink, so modifying its contents
+	 * is safe and will not affect packet layout or cause skb corruption.
+	 * For this reason, the gen_prolog() is essentially a NOP, sice we
+	 * don't need to clone the packet on write accesses.
+	 */
+	.gen_prologue		= bpf_noop_prologue,
 };
 
 const struct bpf_prog_ops ioam6_gob_prog_ops = {
