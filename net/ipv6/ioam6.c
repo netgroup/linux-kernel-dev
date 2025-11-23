@@ -1625,22 +1625,18 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 __bpf_kfunc_start_defs();
 
 __bpf_kfunc int
-bpf_ioam6_trace_gob_store_bytes(struct __sk_buff *skb_ctx, u32 offset,
-				const void *from, u32 from__sz)
+bpf_ioam6_trace_gob_store_bytes(struct bpf_ioam6_trace_gob_ctx *ctx,
+				u32 offset, const void *from, u32 from__sz)
 {
-	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
-
-	return __bpf_ioam6_gob_common(skb, offset, (void *)from, from__sz,
+	return __bpf_ioam6_gob_common(ctx->skb, offset, (void *)from, from__sz,
 				      BPF_IOAM6_GOB_OP_WRITE);
 }
 
 __bpf_kfunc int
-bpf_ioam6_trace_gob_load_bytes(struct __sk_buff *skb_ctx, u32 offset,
-			       void *to, u32 to__sz)
+bpf_ioam6_trace_gob_load_bytes(struct bpf_ioam6_trace_gob_ctx *ctx,
+			       u32 offset, void *to, u32 to__sz)
 {
-	struct sk_buff *skb = (struct sk_buff *)skb_ctx;
-
-	return __bpf_ioam6_gob_common(skb, offset, to, to__sz,
+	return __bpf_ioam6_gob_common(ctx->skb, offset, to, to__sz,
 				      BPF_IOAM6_GOB_OP_READ);
 }
 
