@@ -6057,11 +6057,16 @@ static int check_map_access(struct bpf_verifier_env *env, u32 regno,
 
 #define MAX_PACKET_OFF 0xffff
 
+static bool
+ioam6_gob_may_access_direct_pkt_data(const struct bpf_call_arg_meta *meta,
+				     enum bpf_access_type t);
+
 static bool may_access_direct_pkt_data(struct bpf_verifier_env *env,
 				       const struct bpf_call_arg_meta *meta,
 				       enum bpf_access_type t)
 {
 	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
 
 	switch (prog_type) {
 	/* Program types only with direct read access go here! */
@@ -6089,11 +6094,16 @@ static bool may_access_direct_pkt_data(struct bpf_verifier_env *env,
 		return true;
 
 	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
-	case BPF_PROG_TYPE_IOAM6_GOB:
 		if (t == BPF_WRITE)
 			env->seen_direct_write = true;
 
 		return true;
+
+	case BPF_PROG_TYPE_IOAM6_GOB:
+		if (!meta)
+			return true;
+
+		return ioam6_gob_may_access_direct_pkt_data(meta, t);
 
 	default:
 		return false;
@@ -12376,6 +12386,36 @@ static bool is_kfunc_pkt_changing(struct bpf_kfunc_call_arg_meta *meta)
 	return meta->func_id == special_kfunc_list[KF_bpf_xdp_pull_data];
 }
 
+static bool
+ioam6_gob_may_access_direct_pkt_data(const struct bpf_call_arg_meta *meta,
+				     enum bpf_access_type t)
+{
+#define skl(__func_id) special_kfunc_list[(__func_id)]
+	if (!meta)
+		goto err;
+
+	switch (t) {
+	case BPF_READ:
+		if (meta->func_id == skl(KF_bpf_dynptr_slice_rdwr))
+			goto err;
+
+		return true;
+	case BPF_WRITE:
+		if (meta->func_id == skl(KF_bpf_dynptr_slice_rdwr) ||
+		    meta->func_id == skl(KF_bpf_dynptr_from_skb))
+			return false;
+
+		return true;
+	default:
+		break;
+	}
+
+err:
+	WARN_ON_ONCE(1);
+	return false;
+#undef skl
+}
+
 static enum kfunc_ptr_arg_type
 get_kfunc_ptr_arg_type(struct bpf_verifier_env *env,
 		       struct bpf_kfunc_call_arg_meta *meta,
@@ -13767,8 +13807,28 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_kfunc_ca
 		if (meta->func_id == special_kfunc_list[KF_bpf_dynptr_slice]) {
 			regs[BPF_REG_0].type |= MEM_RDONLY;
 		} else {
+			enum bpf_prog_type ptype = resolve_prog_type(env->prog);
+			struct bpf_call_arg_meta arg_meta, *pam = NULL;
+
+			if (ptype == BPF_PROG_TYPE_IOAM6_GOB) {
+				/* we allow direct acess to the packet only in
+				 * the GOB region; but we want to deny the
+				 * access to the underneath skb through a RDWR
+				 * dynptr slice.
+				 */
+				memset(&arg_meta, 0, sizeof(arg_meta));
+				/* for this program we are only interested in
+				 * passing the func_id; so we need to check if
+				 * we are working with the dynptr_slice_rdrw or
+				 * not.
+				 */
+				arg_meta.func_id = meta->func_id;
+
+				pam = &arg_meta;
+			}
+
 			/* this will set env->seen_direct_write to true */
-			if (!may_access_direct_pkt_data(env, NULL, BPF_WRITE)) {
+			if (!may_access_direct_pkt_data(env, pam, BPF_WRITE)) {
 				verbose(env, "the prog does not allow writes to packet data\n");
 				return -EINVAL;
 			}
@@ -21831,8 +21891,17 @@ static void specialize_kfunc(struct bpf_verifier_env *env,
 		return;
 
 	if (func_id == special_kfunc_list[KF_bpf_dynptr_from_skb]) {
+		struct bpf_call_arg_meta arg_meta, *pam = NULL;
+
+		if (prog->type == BPF_PROG_TYPE_IOAM6_GOB) {
+			memset(&arg_meta, 0, sizeof(arg_meta));
+			arg_meta.func_id = func_id;
+
+			pam = &arg_meta;
+		}
+
 		seen_direct_write = env->seen_direct_write;
-		is_rdonly = !may_access_direct_pkt_data(env, NULL, BPF_WRITE);
+		is_rdonly = !may_access_direct_pkt_data(env, pam, BPF_WRITE);
 
 		if (is_rdonly)
 			*addr = (unsigned long)bpf_dynptr_from_skb_rdonly;
