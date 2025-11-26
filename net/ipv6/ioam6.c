@@ -25,10 +25,6 @@
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 
-DEFINE_PER_CPU(struct ioam6_bpf_trace_state, ioam6_bpf_trace_states) = {
-	.bh_lock	= INIT_LOCAL_LOCK(bh_lock),
-};
-
 static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 {
 	int off = ptr - (void *)skb->data;
@@ -1412,59 +1408,63 @@ ioam6_gob_run_prog(struct sk_buff *skb, struct ioam6_trace_gob_hdr *gob,
 	return err;
 }
 
+static bool ioam6_gob_schema_id_eq(u32 schema_a, u32 schema_b)
+{
+	return schema_a == schema_b;
+}
+
 /* called with rcu_read_lock(); assume that GOB header is present */
 static int
 __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 			    struct ioam6_trace_hdr *trace)
 {
-	struct ioam6_bpf_trace_state *ioam6_state;
 	struct ioam6_trace_gob_hdr *gob, *p;
 	struct ioam6_gob_schema *gobsc;
-	u32 hdr_scid, gob_len;
-	int ret;
+	u32 schema_id, gob_len;
+
+	gobsc = rcu_dereference(ns->gob_schema);
+	if (!gobsc)
+		/* no GOB schema ID associated with this configuration; thus,
+		 * early return since we don't have any eBPF program to be run.
+		 */
+		return 0;
 
 	/* the IOAM has been check if is writable, e.g., is cloned if
 	 * needed or expanded as well, see@ ipv6_hop_ioam().
 	 * Thus, the GOB region must be in the linear part of the skb's data,
 	 * fail otherwise.
 	 */
-	gob = __ioam6_trace_gob_hdr_start_nocheck(trace);
-	gob_len = ioam6_trace_gob_len(gob);
-
-	p = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, gob_len);
-	if (unlikely(gob_len > IOAM6_TRACE_GOB_DATA_SIZE_MAX || !p)) {
-		WARN_ON_ONCE(1);
-		/* something very weird happened, so by returning -EINVAL we
-		 * drop the packet.
-		 */
-		return -EINVAL;
-	}
-
-	gobsc = rcu_dereference(ns->gob_schema);
-	if (!gobsc)
-		return 0;
+	gob = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, sizeof(*gob));
+	if (unlikely(!gob))
+		goto err;
 
 	/* GOB Schema is available, let's retrieve the GOB Schema ID associated
 	 * with this namespace and compare it with the Schema ID carried by the
 	 * GOB Header.
 	 */
-	hdr_scid = ioam6_trace_gob_schema(gob);
-	if (hdr_scid != gobsc->id)
+	schema_id = ioam6_trace_gob_schema(gob);
+	if (!ioam6_gob_schema_id_eq(schema_id, gobsc->id))
 		return 0;
+
+	/* check if the GOB region size is within the max limits or not */
+	gob_len = ioam6_trace_gob_len(gob);
+	if (unlikely(gob_len > IOAM6_TRACE_GOB_DATA_SIZE_MAX))
+		goto err;
+
+	/* check whether the *whole* GOB region is in the linear skb's data */
+	p = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, gob_len);
+	if (unlikely(p != gob))
+		goto err;
 
 	/* The GOB Header carries the same Schema ID active on the current node
 	 * (due to the binding to the current namespace).
 	 */
+	return ioam6_gob_run_prog(skb, gob, gobsc->bpf.prog);
 
-	local_lock_nested_bh(&ioam6_bpf_trace_states.bh_lock);
-
-	ioam6_state = this_cpu_ptr(&ioam6_bpf_trace_states);
-	ioam6_state->trace = trace;
-
-	ret = ioam6_gob_run_prog(skb, gob, gobsc->bpf.prog);
-
-	local_unlock_nested_bh(&ioam6_bpf_trace_states.bh_lock);
-	return ret;
+err:
+	/* received weird and/or malformed packet */
+	net_dbg_ratelimited("ioam6: invalid GOB header");
+	return -EINVAL;
 }
 
 /* called with rcu_read_lock() */
@@ -1563,44 +1563,34 @@ enum bpf_ioam6_gob_op {
 	BPF_IOAM6_GOB_OP_WRITE,
 };
 
+static struct ioam6_trace_gob_hdr *
+ioam6_trace_gob_hdr_from_bpf_ctx(struct bpf_ioam6_trace_gob_ctx *ctx)
+{
+	/* ctx->data points to the GOB payload, which is part of the GOB
+	 * header. By using container_of on ctx->data we can obtain the pointer
+	 * to the enclosing ioam6_trace_gob_hdr structure.
+	 */
+	return container_of(ctx->data, struct ioam6_trace_gob_hdr, data);
+}
+
 static int
-__bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
+__bpf_ioam6_gob_common(struct bpf_ioam6_trace_gob_ctx *ctx, u32 offset,
 		       void *usrptr, u32 usrlen, enum bpf_ioam6_gob_op op)
 {
-	struct ioam6_bpf_trace_state *ioam6_trace_state;
-	struct ioam6_trace_gob_hdr *gob;
-	struct ioam6_trace_hdr *trace;
-	int skb_dataoff, gob_off;
-	int gob_len;
-
-	ioam6_trace_state = this_cpu_ptr(&ioam6_bpf_trace_states);
-	trace = ioam6_trace_state->trace;
-	lockdep_assert_held(&ioam6_trace_state->bh_lock);
-
-	/* trace is set in the GOB eBPF program runner */
-	if (unlikely(!trace || !ioam6_trace_gob_enabled(trace))) {
-		WARN_ON_ONCE(1);
-		return -EINVAL;
-	}
-
-	gob = __ioam6_trace_gob_hdr_start_nocheck(trace);
-	gob_off = ptroff_by_skb_data(skb, gob);
-	gob_len = ioam6_trace_gob_len(gob);
+	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_from_bpf_ctx(ctx);
+	const u32 gob_len = ctx->len;
 
 	/* don't need to check the lower bound as offset is always >= 0*/
 	if (offset + usrlen > gob_len)
 		/* out of bounds */
 		return -EFAULT;
 
-	/* build the offset where the user wants to read/write */
-	skb_dataoff = gob_off + offset;
-
 	switch (op) {
 	case BPF_IOAM6_GOB_OP_WRITE:
 		switch (offset) {
 		case bpf_ctx_range(struct ioam6_trace_gob_hdr, hdr):
 			/* at the moment the GOB header cannot be changed */
-			return -EFAULT;
+			return -EINVAL;
 		default:
 			/* allowed to write in the payload */
 			break;
@@ -1609,15 +1599,16 @@ __bpf_ioam6_gob_common(struct sk_buff *skb, u32 offset,
 		/* we already checked that the GOB is in the linear skb's data
 		 * part, as well as the packet is already cloned/expanded.
 		 */
-		memcpy(skb->data + skb_dataoff, usrptr, usrlen);
+		memcpy((void *)gob + offset, usrptr, usrlen);
 		return 0;
 	case BPF_IOAM6_GOB_OP_READ:
 		/* the same as write for what concerns the skb linearity */
-		memcpy(usrptr, (void *)gob + offset, usrlen);
+		memcpy(usrptr, (const void *)gob + offset, usrlen);
 		return 0;
 	case BPF_IOAM6_GOB_OP_UNSPEC:
 		/* fallthrough */
 	default:
+		WARN_ON_ONCE(1);
 		return -EINVAL;
 	}
 }
@@ -1628,7 +1619,7 @@ __bpf_kfunc int
 bpf_ioam6_trace_gob_store_bytes(struct bpf_ioam6_trace_gob_ctx *ctx,
 				u32 offset, const void *from, u32 from__sz)
 {
-	return __bpf_ioam6_gob_common(ctx->skb, offset, (void *)from, from__sz,
+	return __bpf_ioam6_gob_common(ctx, offset, (void *)from, from__sz,
 				      BPF_IOAM6_GOB_OP_WRITE);
 }
 
@@ -1636,7 +1627,7 @@ __bpf_kfunc int
 bpf_ioam6_trace_gob_load_bytes(struct bpf_ioam6_trace_gob_ctx *ctx,
 			       u32 offset, void *to, u32 to__sz)
 {
-	return __bpf_ioam6_gob_common(ctx->skb, offset, to, to__sz,
+	return __bpf_ioam6_gob_common(ctx, offset, to, to__sz,
 				      BPF_IOAM6_GOB_OP_READ);
 }
 

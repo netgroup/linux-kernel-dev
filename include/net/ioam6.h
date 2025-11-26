@@ -64,13 +64,6 @@ struct ioam6_pernet_data {
 	struct rhashtable gob_schemas;
 };
 
-struct ioam6_bpf_trace_state {
-	local_lock_t bh_lock;
-	struct ioam6_trace_hdr *trace;
-};
-
-DECLARE_PER_CPU(struct ioam6_bpf_trace_state, ioam6_bpf_trace_states);
-
 static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
 {
 #if IS_ENABLED(CONFIG_IPV6)
