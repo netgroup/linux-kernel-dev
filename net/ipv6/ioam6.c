@@ -1382,8 +1382,12 @@ ioam6_gob_run_prog(struct sk_buff *skb, struct ioam6_trace_gob_hdr *gob,
 	ctx.data_end = ctx.data + gob_plen;
 	ctx.skb = skb;
 
-	/* XXX: is it still needed? and if yes, who save the skb->cb now? */
-	bpf_compute_data_pointers(skb);
+	/* XXX: compute the linear packet data range is not needed anymore.
+	 * We are not accessing the ctx->skb data directly but only using
+	 * dynptrs which don't require the cb->data_end/meta_data_end to be
+	 * set; in other words, the bpf_compute_data_pointers() et simila are
+	 * not required and this avoids to mangle/alter the skb's CB.
+	 */
 
 	/* Note that a IOAM6_GOB eBPF program cannot change the size of the
 	 * packet, and the ioam6 code already checked if the whole HBH was
