@@ -2643,6 +2643,11 @@ static void bpf_prog_load_fixup_attach_type(union bpf_attr *attr)
 			attr->expected_attach_type =
 				BPF_SK_REUSEPORT_SELECT;
 		break;
+	case BPF_PROG_TYPE_IOAM6_GOB:
+		/* set the attach_type if not provided */
+		if (!attr->expected_attach_type)
+			attr->expected_attach_type =
+				BPF_IOAM6_GOB;
 	}
 }
 
@@ -2741,6 +2746,10 @@ bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
 		}
 	case BPF_PROG_TYPE_NETFILTER:
 		if (expected_attach_type == BPF_NETFILTER)
+			return 0;
+		return -EINVAL;
+	case BPF_PROG_TYPE_IOAM6_GOB:
+		if (expected_attach_type == BPF_IOAM6_GOB)
 			return 0;
 		return -EINVAL;
 	case BPF_PROG_TYPE_SYSCALL:
