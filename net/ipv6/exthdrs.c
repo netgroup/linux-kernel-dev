@@ -902,9 +902,11 @@ static bool ipv6_hop_ra(struct sk_buff *skb, int optoff)
 
 static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
 {
+	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_trace_hdr *trace;
 	struct ioam6_namespace *ns;
 	struct ioam6_hdr *hdr;
+	int gob_len = 0;
 	int ret = 0;
 
 	/* Bad alignment (must be 4n-aligned) */
@@ -928,7 +930,19 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
 
 		/* Malformed Pre-allocated Trace header */
 		trace = (struct ioam6_trace_hdr *)((u8 *)hdr + sizeof(*hdr));
-		if (hdr->opt_len < 2 + sizeof(*trace) + trace->remlen * 4)
+
+		gob = ioam6_trace_gob_hdr_start(trace);
+		if (gob) {
+			/* Let's check GOB boundaries */
+			if (hdr->opt_len < 2 + sizeof(*trace) + sizeof(*gob))
+				goto drop;
+
+			/* GOB is made of the header + the payload */
+			gob_len = sizeof(*gob) + ioam6_trace_gob_plen(gob);
+		}
+
+		if (hdr->opt_len < 2 +
+		    sizeof(*trace) + gob_len + trace->remlen * 4)
 			goto drop;
 
 		/* Ignore if the IOAM namespace is unknown */
