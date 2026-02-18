@@ -20,22 +20,28 @@
 #include <net/ioam6.h>
 #include <net/sch_generic.h>
 
+#ifdef CONFIG_IPV6_IOAM6_GOB
 #include <linux/filter.h>
 #include <linux/bpf.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
+#endif
 
+
+static struct genl_family ioam6_genl_family;
+
+static int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
+{
+	return sizeof(*gob_hdr) + ioam6_trace_gob_plen(gob_hdr);
+}
+
+#ifdef CONFIG_IPV6_IOAM6_GOB
 static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 {
 	int off = ptr - (void *)skb->data;
 
 	WARN_ON_ONCE(off < 0);
 	return off;
-}
-
-static int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
-{
-	return sizeof(*gob_hdr) + ioam6_trace_gob_plen(gob_hdr);
 }
 
 static struct ioam6_trace_gob_hdr *
@@ -49,28 +55,6 @@ __ioam6_trace_gob_hdr_pointer_if_linear(struct sk_buff *skb,
 	int gob_off = ptroff_by_skb_data(skb, trace->data);
 
 	return skb_pointer_if_linear(skb, gob_off, offset);
-}
-
-static __u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
-{
-	struct ioam6_trace_gob_hdr *gob_hdr;
-	int off = 0;
-
-	gob_hdr = ioam6_trace_gob_hdr_start(trace);
-	if (gob_hdr)
-		off = ioam6_trace_gob_len(gob_hdr);
-
-	return trace->data + off;
-}
-
-static void ioam6_ns_release(struct ioam6_namespace *ns)
-{
-	kfree_rcu(ns, rcu);
-}
-
-static void ioam6_sc_release(struct ioam6_schema *sc)
-{
-	kfree_rcu(sc, rcu);
 }
 
 static void ioam6_gob_sc_free_callback_rcu(struct rcu_head *head)
@@ -90,6 +74,560 @@ static void ioam6_gob_sc_release(struct ioam6_gob_schema *gobsc)
 	call_rcu(&gobsc->rcu, ioam6_gob_sc_free_callback_rcu);
 }
 
+static void ioam6_free_gob_sc(void *ptr, void *arg)
+{
+	struct ioam6_gob_schema *gobsc = (struct ioam6_gob_schema *)ptr;
+
+	if (gobsc)
+		ioam6_gob_sc_release(gobsc);
+}
+
+static int ioam6_gob_sc_cmpfn(struct rhashtable_compare_arg *arg,
+			      const void *obj)
+{
+	const struct ioam6_gob_schema *gobsc = obj;
+
+	return (gobsc->id != *(u32 *)arg->key);
+}
+
+static const struct rhashtable_params rht_gob_sc_params = {
+	.key_len		= sizeof(u32),
+	.key_offset		= offsetof(struct ioam6_gob_schema, id),
+	.head_offset		= offsetof(struct ioam6_gob_schema, head),
+	.automatic_shrinking	= true,
+	.obj_cmpfn		= ioam6_gob_sc_cmpfn,
+};
+
+static const struct nla_policy ioam6_genl_policy_add_gobsc[] = {
+	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
+	[IOAM6_ATTR_GOB_SC_BPF]	= { .type = NLA_NESTED },
+};
+
+#define MAX_PROG_NAME 256
+static const struct nla_policy
+ioam_gob_bpf_prog_policy[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1] = {
+	[IOAM6_TRACE_GOB_BPF_PROG]	= { .type = NLA_U32, },
+	[IOAM6_TRACE_GOB_BPF_PROG_NAME]	= { .type = NLA_NUL_STRING,
+					    .len = MAX_PROG_NAME },
+};
+
+static const struct nla_policy ioam6_genl_policy_del_gobsc[] = {
+	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
+};
+
+static const struct nla_policy ioam6_genl_policy_ns_gob_sc[] = {
+	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
+	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
+	[IOAM6_ATTR_GOB_SC_NONE] = { .type = NLA_FLAG },
+};
+
+static void ioam6_genl_delns_gob_cleanup(struct ioam6_pernet_data *nsdata,
+					 struct ioam6_namespace *ns)
+{
+	struct ioam6_gob_schema *gobsc;
+
+	gobsc = rcu_dereference_protected(ns->gob_schema,
+					  lockdep_is_held(&nsdata->lock));
+	if (gobsc)
+		rcu_assign_pointer(gobsc->ns, NULL);
+}
+
+static int
+__ioam6_genl_dumpns_element_gob_rcu(struct ioam6_namespace *ns,
+				    struct sk_buff *skb)
+{
+	struct ioam6_gob_schema *gobsc = rcu_dereference(ns->gob_schema);
+
+	return gobsc ? nla_put_u32(skb, IOAM6_ATTR_GOB_SC_ID, gobsc->id) : 0;
+}
+
+static int __ioam6_genl_dump_gobsc_element(struct ioam6_gob_schema *gobsc,
+					   u32 portid, u32 seq, u32 flags,
+					   struct sk_buff *skb, u8 cmd)
+{
+	struct ioam6_namespace *ns;
+	struct nlattr *nest;
+	void *hdr;
+
+	hdr = genlmsg_put(skb, portid, seq, &ioam6_genl_family, flags, cmd);
+	if (!hdr)
+		return -ENOMEM;
+
+	if (nla_put_u32(skb, IOAM6_ATTR_GOB_SC_ID, gobsc->id))
+		goto nla_put_failure;
+
+	nest = nla_nest_start_noflag(skb, IOAM6_ATTR_GOB_SC_BPF);
+	if (!nest)
+		goto nla_put_failure;
+
+	if (nla_put_u32(skb, IOAM6_TRACE_GOB_BPF_PROG,
+			gobsc->bpf.prog->aux->id))
+		goto nla_put_failure;
+
+	if (gobsc->bpf.name &&
+	    nla_put_string(skb, IOAM6_TRACE_GOB_BPF_PROG_NAME, gobsc->bpf.name))
+		goto nla_put_failure;
+
+	nla_nest_end(skb, nest);
+
+	rcu_read_lock();
+
+	ns = rcu_dereference(gobsc->ns);
+	if (ns && nla_put_u16(skb, IOAM6_ATTR_NS_ID, be16_to_cpu(ns->id))) {
+		rcu_read_unlock();
+		goto nla_put_failure;
+	}
+
+	rcu_read_unlock();
+
+	genlmsg_end(skb, hdr);
+	return 0;
+
+nla_put_failure:
+	genlmsg_cancel(skb, hdr);
+	return -EMSGSIZE;
+}
+
+static int ioam6_genl_dump_gobsc_start(struct netlink_callback *cb)
+{
+	struct ioam6_pernet_data *nsdata = ioam6_pernet(sock_net(cb->skb->sk));
+	struct rhashtable_iter *iter = (struct rhashtable_iter *)cb->args[0];
+
+	if (!iter) {
+		iter = kmalloc(sizeof(*iter), GFP_KERNEL);
+		if (!iter)
+			return -ENOMEM;
+
+		cb->args[0] = (long)iter;
+	}
+
+	rhashtable_walk_enter(&nsdata->gob_schemas, iter);
+
+	return 0;
+}
+
+#define ioam6_genl_dump_gobsc_done ioam6_genl_dumpsc_done
+
+static int
+ioam6_genl_dump_gobsc(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	struct ioam6_gob_schema *gobsc;
+	struct rhashtable_iter *iter;
+	int err;
+
+	iter = (struct rhashtable_iter *)cb->args[0];
+	rhashtable_walk_start(iter);
+
+	for (;;) {
+		gobsc = rhashtable_walk_next(iter);
+
+		if (IS_ERR(gobsc)) {
+			if (PTR_ERR(gobsc) == -EAGAIN)
+				continue;
+			err = PTR_ERR(gobsc);
+			goto done;
+		} else if (!gobsc) {
+			break;
+		}
+
+		err = __ioam6_genl_dump_gobsc_element(gobsc,
+						      NETLINK_CB(cb->skb).portid,
+						      cb->nlh->nlmsg_seq,
+						      NLM_F_MULTI,
+						      skb,
+						      IOAM6_CMD_DUMP_GOB_SCHEMAS);
+		if (err)
+			goto done;
+	}
+
+	err = skb->len;
+
+done:
+	rhashtable_walk_stop(iter);
+	return err;
+}
+
+static int ioam6_genl_add_gobsc(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nlattr *tb[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1];
+	struct ioam6_pernet_data *nsdata;
+	struct ioam6_gob_schema *gobsc;
+	struct bpf_prog *p;
+	u32 id, fd;
+	int err;
+
+	if (!info->attrs[IOAM6_ATTR_GOB_SC_ID] ||
+	    !info->attrs[IOAM6_ATTR_GOB_SC_BPF])
+		return -EINVAL;
+
+	id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
+
+	err = nla_parse_nested_deprecated(tb, IOAM6_TRACE_GOB_BPF_PROG_MAX,
+					  info->attrs[IOAM6_ATTR_GOB_SC_BPF],
+					  ioam_gob_bpf_prog_policy, NULL);
+	if (err < 0)
+		return err;
+
+	if (!tb[IOAM6_TRACE_GOB_BPF_PROG] || !tb[IOAM6_TRACE_GOB_BPF_PROG_NAME])
+		return -EINVAL;
+
+	nsdata = ioam6_pernet(genl_info_net(info));
+
+	mutex_lock(&nsdata->lock);
+
+	gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &id,
+				       rht_gob_sc_params);
+	if (gobsc) {
+		err = -EEXIST;
+		goto out_unlock;
+	}
+
+	gobsc = kzalloc(sizeof(*gobsc), GFP_KERNEL);
+	if (!gobsc) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+
+	gobsc->id = id;
+	gobsc->bpf.name = nla_memdup(tb[IOAM6_TRACE_GOB_BPF_PROG_NAME],
+				     GFP_KERNEL);
+	if (!gobsc->bpf.name) {
+		err = -ENOMEM;
+		goto free_sc;
+	}
+
+	fd = nla_get_u32(tb[IOAM6_TRACE_GOB_BPF_PROG]);
+
+	p = bpf_prog_get_type(fd, BPF_PROG_TYPE_IOAM6_GOB);
+	if (IS_ERR(p)) {
+		err = PTR_ERR(p);
+		goto free_bpf_name;
+	}
+
+	gobsc->bpf.prog = p;
+
+	err = rhashtable_lookup_insert_fast(&nsdata->gob_schemas, &gobsc->head,
+					    rht_gob_sc_params);
+	if (err)
+		goto free_bpf_prog;
+
+out_unlock:
+	mutex_unlock(&nsdata->lock);
+	return err;
+free_bpf_prog:
+	bpf_prog_put(gobsc->bpf.prog);
+free_bpf_name:
+	kfree(gobsc->bpf.name);
+free_sc:
+	kfree(gobsc);
+	goto out_unlock;
+}
+
+static int ioam6_genl_del_gobsc(struct sk_buff *skb, struct genl_info *info)
+{
+	struct ioam6_pernet_data *nsdata;
+	struct ioam6_gob_schema *gobsc;
+	struct ioam6_namespace *ns;
+	int err;
+	u32 id;
+
+	if (!info->attrs[IOAM6_ATTR_GOB_SC_ID])
+		return -EINVAL;
+
+	id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
+	nsdata = ioam6_pernet(genl_info_net(info));
+
+	mutex_lock(&nsdata->lock);
+
+	gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &id,
+				       rht_gob_sc_params);
+	if (!gobsc) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+
+	err = rhashtable_remove_fast(&nsdata->gob_schemas, &gobsc->head,
+				     rht_gob_sc_params);
+	if (err)
+		goto out_unlock;
+
+	ns = rcu_dereference_protected(gobsc->ns,
+				       lockdep_is_held(&nsdata->lock));
+	if (ns)
+		rcu_assign_pointer(ns->gob_schema, NULL);
+
+	ioam6_gob_sc_release(gobsc);
+
+out_unlock:
+	mutex_unlock(&nsdata->lock);
+	return err;
+}
+
+static const struct rhashtable_params rht_ns_params;
+
+static int
+ioam6_genl_ns_set_gob_schema(struct sk_buff *skb, struct genl_info *info)
+{
+	struct ioam6_gob_schema *gobsc, *gobsc_ref;
+	struct ioam6_namespace *ns, *ns_ref;
+	struct ioam6_pernet_data *nsdata;
+	__be16 ns_id;
+	u32 gobsc_id;
+	int err;
+
+	if (!info->attrs[IOAM6_ATTR_NS_ID] ||
+	    (!info->attrs[IOAM6_ATTR_GOB_SC_ID] &&
+	     !info->attrs[IOAM6_ATTR_GOB_SC_NONE]))
+		return -EINVAL;
+
+	ns_id = cpu_to_be16(nla_get_u16(info->attrs[IOAM6_ATTR_NS_ID]));
+	nsdata = ioam6_pernet(genl_info_net(info));
+
+	mutex_lock(&nsdata->lock);
+
+	ns = rhashtable_lookup_fast(&nsdata->namespaces, &ns_id, rht_ns_params);
+	if (!ns) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+
+	if (info->attrs[IOAM6_ATTR_GOB_SC_NONE]) {
+		gobsc = NULL;
+	} else {
+		gobsc_id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
+		gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &gobsc_id,
+					       rht_gob_sc_params);
+		if (!gobsc) {
+			err = -ENOENT;
+			goto out_unlock;
+		}
+	}
+
+	gobsc_ref = rcu_dereference_protected(ns->gob_schema,
+					      lockdep_is_held(&nsdata->lock));
+	if (gobsc_ref)
+		rcu_assign_pointer(gobsc_ref->ns, NULL);
+	rcu_assign_pointer(ns->gob_schema, gobsc);
+
+	if (gobsc) {
+		ns_ref = rcu_dereference_protected(gobsc->ns,
+						   lockdep_is_held(&nsdata->lock));
+		if (ns_ref)
+			rcu_assign_pointer(ns_ref->gob_schema, NULL);
+		rcu_assign_pointer(gobsc->ns, ns);
+	}
+
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&nsdata->lock);
+	return err;
+}
+
+static int
+ioam6_gob_run_prog(struct sk_buff *skb, struct ioam6_trace_gob_hdr *gob,
+		   struct bpf_prog *prog)
+{
+	u32 gob_schema = ioam6_trace_gob_schema(gob);
+	u32 gob_plen = ioam6_trace_gob_plen(gob);
+	u32 gob_len = sizeof(*gob) + gob_plen;
+	struct bpf_ioam6_trace_gob_ctx ctx;
+	int ret, err = 0;
+
+	/* initialize the bpf prog context */
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.len = gob_len;
+	ctx.schema = gob_schema;
+	ctx.data = (void *)gob->data;
+	ctx.data_end = ctx.data + gob_plen;
+	ctx.skb = skb;
+
+	/* XXX: compute the linear packet data range is not needed anymore.
+	 * We are not accessing the ctx->skb data directly but only using
+	 * dynptrs which don't require the cb->data_end/meta_data_end to be
+	 * set; in other words, the bpf_compute_data_pointers() et simila are
+	 * not required and this avoids to mangle/alter the skb's CB.
+	 */
+
+	/* Note that a IOAM6_GOB eBPF program cannot change the size of the
+	 * packet, and the ioam6 code already checked if the whole HBH was
+	 * writable or not. So in theory, we don't expect to clone or expand
+	 * the packet again, and thus change the skb pointers.
+	 * Moreover, this eBPF program does not allow to use helpers who mangle
+	 * the packet in a way that pointers to the skb must be invalidated.
+	 */
+	ret = bpf_prog_run_pin_on_cpu(prog, &ctx);
+	switch (ret) {
+	case BPF_OK:
+		break;
+	case BPF_DROP:
+		err = -EINVAL;
+		break;
+	default:
+		pr_warn_once("bpf-ioam6-gob: Illegal return value %d\n", ret);
+		err = -EFAULT;
+		break;
+	}
+
+	return err;
+}
+
+static bool ioam6_gob_schema_id_eq(u32 schema_a, u32 schema_b)
+{
+	return schema_a == schema_b;
+}
+
+/* called with rcu_read_lock(); assume that GOB header is present */
+static int
+__ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
+			    struct ioam6_trace_hdr *trace)
+{
+	struct ioam6_trace_gob_hdr *gob, *p;
+	struct ioam6_gob_schema *gobsc;
+	u32 schema_id, gob_len;
+
+	gobsc = rcu_dereference(ns->gob_schema);
+	if (!gobsc)
+		/* no GOB schema ID associated with this configuration; thus,
+		 * early return since we don't have any eBPF program to be run.
+		 */
+		return 0;
+
+	/* the IOAM has been check if is writable, e.g., is cloned if
+	 * needed or expanded as well, see@ ipv6_hop_ioam().
+	 * Thus, the GOB region must be in the linear part of the skb's data,
+	 * fail otherwise.
+	 */
+	gob = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, sizeof(*gob));
+	if (unlikely(!gob))
+		goto err;
+
+	/* GOB Schema is available, let's retrieve the GOB Schema ID associated
+	 * with this namespace and compare it with the Schema ID carried by the
+	 * GOB Header.
+	 */
+	schema_id = ioam6_trace_gob_schema(gob);
+	if (!ioam6_gob_schema_id_eq(schema_id, gobsc->id))
+		return 0;
+
+	/* check if the GOB region size is within the max limits or not */
+	gob_len = ioam6_trace_gob_len(gob);
+	if (unlikely(gob_len > IOAM6_TRACE_GOB_DATA_SIZE_MAX))
+		goto err;
+
+	/* check whether the *whole* GOB region is in the linear skb's data */
+	p = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, gob_len);
+	if (unlikely(p != gob))
+		goto err;
+
+	/* The GOB Header carries the same Schema ID active on the current node
+	 * (due to the binding to the current namespace).
+	 */
+	return ioam6_gob_run_prog(skb, gob, gobsc->bpf.prog);
+
+err:
+	/* received weird and/or malformed packet */
+	net_dbg_ratelimited("ioam6: invalid GOB header");
+	return -EINVAL;
+}
+
+enum bpf_ioam6_gob_op {
+	BPF_IOAM6_GOB_OP_UNSPEC		= 0,
+	BPF_IOAM6_GOB_OP_READ,
+	BPF_IOAM6_GOB_OP_WRITE,
+};
+
+static struct ioam6_trace_gob_hdr *
+ioam6_trace_gob_hdr_from_bpf_ctx(struct bpf_ioam6_trace_gob_ctx *ctx)
+{
+	/* ctx->data points to the GOB payload, which is part of the GOB
+	 * header. By using container_of on ctx->data we can obtain the pointer
+	 * to the enclosing ioam6_trace_gob_hdr structure.
+	 */
+	return container_of(ctx->data, struct ioam6_trace_gob_hdr, data);
+}
+
+static int
+__bpf_ioam6_gob_common(struct bpf_ioam6_trace_gob_ctx *ctx, u32 offset,
+		       void *usrptr, u32 usrlen, enum bpf_ioam6_gob_op op)
+{
+	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_from_bpf_ctx(ctx);
+	const u32 gob_len = ctx->len;
+
+	/* don't need to check the lower bound as offset is always >= 0*/
+	if (offset + usrlen > gob_len)
+		/* out of bounds */
+		return -EFAULT;
+
+	switch (op) {
+	case BPF_IOAM6_GOB_OP_WRITE:
+		switch (offset) {
+		case bpf_ctx_range(struct ioam6_trace_gob_hdr, hdr):
+			/* at the moment the GOB header cannot be changed */
+			return -EINVAL;
+		default:
+			/* allowed to write in the payload */
+			break;
+		}
+
+		/* we already checked that the GOB is in the linear skb's data
+		 * part, as well as the packet is already cloned/expanded.
+		 */
+		memcpy((void *)gob + offset, usrptr, usrlen);
+		return 0;
+	case BPF_IOAM6_GOB_OP_READ:
+		/* the same as write for what concerns the skb linearity */
+		memcpy(usrptr, (const void *)gob + offset, usrlen);
+		return 0;
+	case BPF_IOAM6_GOB_OP_UNSPEC:
+		/* fallthrough */
+	default:
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+}
+
+__bpf_kfunc_start_defs();
+
+__bpf_kfunc int
+bpf_ioam6_trace_gob_store_bytes(struct bpf_ioam6_trace_gob_ctx *ctx,
+				u32 offset, const void *from, u32 from__sz)
+{
+	return __bpf_ioam6_gob_common(ctx, offset, (void *)from, from__sz,
+				      BPF_IOAM6_GOB_OP_WRITE);
+}
+
+__bpf_kfunc int
+bpf_ioam6_trace_gob_load_bytes(struct bpf_ioam6_trace_gob_ctx *ctx,
+			       u32 offset, void *to, u32 to__sz)
+{
+	return __bpf_ioam6_gob_common(ctx, offset, to, to__sz,
+				      BPF_IOAM6_GOB_OP_READ);
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(ioam6_kfunc_fset)
+BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_store_bytes)
+BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_load_bytes);
+BTF_KFUNCS_END(ioam6_kfunc_fset)
+
+static const struct btf_kfunc_id_set ioam6_bpf_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &ioam6_kfunc_fset,
+};
+#endif /* CONFIG_IPV6_IOAM6_GOB */
+
+static void ioam6_ns_release(struct ioam6_namespace *ns)
+{
+	kfree_rcu(ns, rcu);
+}
+
+static void ioam6_sc_release(struct ioam6_schema *sc)
+{
+	kfree_rcu(sc, rcu);
+}
+
 static void ioam6_free_ns(void *ptr, void *arg)
 {
 	struct ioam6_namespace *ns = (struct ioam6_namespace *)ptr;
@@ -106,14 +644,6 @@ static void ioam6_free_sc(void *ptr, void *arg)
 		ioam6_sc_release(sc);
 }
 
-static void ioam6_free_gob_sc(void *ptr, void *arg)
-{
-	struct ioam6_gob_schema *gobsc = (struct ioam6_gob_schema *)ptr;
-
-	if (gobsc)
-		ioam6_gob_sc_release(gobsc);
-}
-
 static int ioam6_ns_cmpfn(struct rhashtable_compare_arg *arg, const void *obj)
 {
 	const struct ioam6_namespace *ns = obj;
@@ -126,14 +656,6 @@ static int ioam6_sc_cmpfn(struct rhashtable_compare_arg *arg, const void *obj)
 	const struct ioam6_schema *sc = obj;
 
 	return (sc->id != *(u32 *)arg->key);
-}
-
-static int ioam6_gob_sc_cmpfn(struct rhashtable_compare_arg *arg,
-			      const void *obj)
-{
-	const struct ioam6_gob_schema *gobsc = obj;
-
-	return (gobsc->id != *(u32 *)arg->key);
 }
 
 static const struct rhashtable_params rht_ns_params = {
@@ -152,16 +674,6 @@ static const struct rhashtable_params rht_sc_params = {
 	.obj_cmpfn		= ioam6_sc_cmpfn,
 };
 
-static const struct rhashtable_params rht_gob_sc_params = {
-	.key_len		= sizeof(u32),
-	.key_offset		= offsetof(struct ioam6_gob_schema, id),
-	.head_offset		= offsetof(struct ioam6_gob_schema, head),
-	.automatic_shrinking	= true,
-	.obj_cmpfn		= ioam6_gob_sc_cmpfn,
-};
-
-static struct genl_family ioam6_genl_family;
-
 static const struct nla_policy ioam6_genl_policy_addns[] = {
 	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
 	[IOAM6_ATTR_NS_DATA]	= { .type = NLA_U32 },
@@ -178,37 +690,14 @@ static const struct nla_policy ioam6_genl_policy_addsc[] = {
 				    .len = IOAM6_MAX_SCHEMA_DATA_LEN },
 };
 
-static const struct nla_policy ioam6_genl_policy_add_gobsc[] = {
-	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
-	[IOAM6_ATTR_GOB_SC_BPF]	= { .type = NLA_NESTED },
-};
-
-#define MAX_PROG_NAME 256
-static const struct nla_policy
-ioam_gob_bpf_prog_policy[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1] = {
-	[IOAM6_TRACE_GOB_BPF_PROG]	= { .type = NLA_U32, },
-	[IOAM6_TRACE_GOB_BPF_PROG_NAME]	= { .type = NLA_NUL_STRING,
-					    .len = MAX_PROG_NAME },
-};
-
 static const struct nla_policy ioam6_genl_policy_delsc[] = {
 	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
-};
-
-static const struct nla_policy ioam6_genl_policy_del_gobsc[] = {
-	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
 };
 
 static const struct nla_policy ioam6_genl_policy_ns_sc[] = {
 	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
 	[IOAM6_ATTR_SC_ID]	= { .type = NLA_U32 },
 	[IOAM6_ATTR_SC_NONE]	= { .type = NLA_FLAG },
-};
-
-static const struct nla_policy ioam6_genl_policy_ns_gob_sc[] = {
-	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
-	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
-	[IOAM6_ATTR_GOB_SC_NONE] = { .type = NLA_FLAG },
 };
 
 static int ioam6_genl_addns(struct sk_buff *skb, struct genl_info *info)
@@ -264,7 +753,6 @@ out_unlock:
 static int ioam6_genl_delns(struct sk_buff *skb, struct genl_info *info)
 {
 	struct ioam6_pernet_data *nsdata;
-	struct ioam6_gob_schema *gobsc;
 	struct ioam6_namespace *ns;
 	struct ioam6_schema *sc;
 	__be16 id;
@@ -287,9 +775,6 @@ static int ioam6_genl_delns(struct sk_buff *skb, struct genl_info *info)
 	sc = rcu_dereference_protected(ns->schema,
 				       lockdep_is_held(&nsdata->lock));
 
-	gobsc = rcu_dereference_protected(ns->gob_schema,
-					  lockdep_is_held(&nsdata->lock));
-
 	err = rhashtable_remove_fast(&nsdata->namespaces, &ns->head,
 				     rht_ns_params);
 	if (err)
@@ -297,8 +782,9 @@ static int ioam6_genl_delns(struct sk_buff *skb, struct genl_info *info)
 
 	if (sc)
 		rcu_assign_pointer(sc->ns, NULL);
-	if (gobsc)
-		rcu_assign_pointer(gobsc->ns, NULL);
+#ifdef CONFIG_IPV6_IOAM6_GOB
+	ioam6_genl_delns_gob_cleanup(nsdata, ns);
+#endif
 
 	ioam6_ns_release(ns);
 
@@ -314,7 +800,6 @@ static int __ioam6_genl_dumpns_element(struct ioam6_namespace *ns,
 				       struct sk_buff *skb,
 				       u8 cmd)
 {
-	struct ioam6_gob_schema *gobsc;
 	struct ioam6_schema *sc;
 	u64 data64;
 	u32 data32;
@@ -338,22 +823,20 @@ static int __ioam6_genl_dumpns_element(struct ioam6_namespace *ns,
 	rcu_read_lock();
 
 	sc = rcu_dereference(ns->schema);
-	if (sc && nla_put_u32(skb, IOAM6_ATTR_SC_ID, sc->id)) {
-		rcu_read_unlock();
-		goto nla_put_failure;
-	}
+	if (sc && nla_put_u32(skb, IOAM6_ATTR_SC_ID, sc->id))
+		goto unlock_and_fail;
 
-	gobsc = rcu_dereference(ns->gob_schema);
-	if (gobsc && nla_put_u32(skb, IOAM6_ATTR_GOB_SC_ID, gobsc->id)) {
-		rcu_read_unlock();
-		goto nla_put_failure;
-	}
-
+#ifdef CONFIG_IPV6_IOAM6_GOB
+	if (__ioam6_genl_dumpns_element_gob_rcu(ns, skb))
+		goto unlock_and_fail;
+#endif
 	rcu_read_unlock();
 
 	genlmsg_end(skb, hdr);
 	return 0;
 
+unlock_and_fail:
+	rcu_read_unlock();
 nla_put_failure:
 	genlmsg_cancel(skb, hdr);
 	return -EMSGSIZE;
@@ -611,228 +1094,6 @@ done:
 	return err;
 }
 
-static int __ioam6_genl_dump_gobsc_element(struct ioam6_gob_schema *gobsc,
-					   u32 portid, u32 seq, u32 flags,
-					   struct sk_buff *skb, u8 cmd)
-{
-	struct ioam6_namespace *ns;
-	struct nlattr *nest;
-	void *hdr;
-
-	hdr = genlmsg_put(skb, portid, seq, &ioam6_genl_family, flags, cmd);
-	if (!hdr)
-		return -ENOMEM;
-
-	if (nla_put_u32(skb, IOAM6_ATTR_GOB_SC_ID, gobsc->id))
-		goto nla_put_failure;
-
-	nest = nla_nest_start_noflag(skb, IOAM6_ATTR_GOB_SC_BPF);
-	if (!nest)
-		goto nla_put_failure;
-
-	if (nla_put_u32(skb, IOAM6_TRACE_GOB_BPF_PROG,
-			gobsc->bpf.prog->aux->id))
-		goto nla_put_failure;
-
-	if (gobsc->bpf.name &&
-	    nla_put_string(skb, IOAM6_TRACE_GOB_BPF_PROG_NAME, gobsc->bpf.name))
-		goto nla_put_failure;
-
-	nla_nest_end(skb, nest);
-
-	rcu_read_lock();
-
-	ns = rcu_dereference(gobsc->ns);
-	if (ns && nla_put_u16(skb, IOAM6_ATTR_NS_ID, be16_to_cpu(ns->id))) {
-		rcu_read_unlock();
-		goto nla_put_failure;
-	}
-
-	rcu_read_unlock();
-
-	genlmsg_end(skb, hdr);
-	return 0;
-
-nla_put_failure:
-	genlmsg_cancel(skb, hdr);
-	return -EMSGSIZE;
-}
-
-static int ioam6_genl_dump_gobsc_start(struct netlink_callback *cb)
-{
-	struct ioam6_pernet_data *nsdata = ioam6_pernet(sock_net(cb->skb->sk));
-	struct rhashtable_iter *iter = (struct rhashtable_iter *)cb->args[0];
-
-	if (!iter) {
-		iter = kmalloc(sizeof(*iter), GFP_KERNEL);
-		if (!iter)
-			return -ENOMEM;
-
-		cb->args[0] = (long)iter;
-	}
-
-	rhashtable_walk_enter(&nsdata->gob_schemas, iter);
-
-	return 0;
-}
-
-#define ioam6_genl_dump_gobsc_done ioam6_genl_dumpsc_done
-
-static int
-ioam6_genl_dump_gobsc(struct sk_buff *skb, struct netlink_callback *cb)
-{
-	struct ioam6_gob_schema *gobsc;
-	struct rhashtable_iter *iter;
-	int err;
-
-	iter = (struct rhashtable_iter *)cb->args[0];
-	rhashtable_walk_start(iter);
-
-	for (;;) {
-		gobsc = rhashtable_walk_next(iter);
-
-		if (IS_ERR(gobsc)) {
-			if (PTR_ERR(gobsc) == -EAGAIN)
-				continue;
-			err = PTR_ERR(gobsc);
-			goto done;
-		} else if (!gobsc) {
-			break;
-		}
-
-		err = __ioam6_genl_dump_gobsc_element(gobsc,
-						      NETLINK_CB(cb->skb).portid,
-						      cb->nlh->nlmsg_seq,
-						      NLM_F_MULTI,
-						      skb,
-						      IOAM6_CMD_DUMP_GOB_SCHEMAS);
-		if (err)
-			goto done;
-	}
-
-	err = skb->len;
-
-done:
-	rhashtable_walk_stop(iter);
-	return err;
-}
-
-static int ioam6_genl_add_gobsc(struct sk_buff *skb, struct genl_info *info)
-{
-	struct nlattr *tb[IOAM6_TRACE_GOB_BPF_PROG_MAX + 1];
-	struct ioam6_pernet_data *nsdata;
-	struct ioam6_gob_schema *gobsc;
-	struct bpf_prog *p;
-	u32 id, fd;
-	int err;
-
-	if (!info->attrs[IOAM6_ATTR_GOB_SC_ID] ||
-	    !info->attrs[IOAM6_ATTR_GOB_SC_BPF])
-		return -EINVAL;
-
-	id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
-
-	err = nla_parse_nested_deprecated(tb, IOAM6_TRACE_GOB_BPF_PROG_MAX,
-					  info->attrs[IOAM6_ATTR_GOB_SC_BPF],
-					  ioam_gob_bpf_prog_policy, NULL);
-	if (err < 0)
-		return err;
-
-	if (!tb[IOAM6_TRACE_GOB_BPF_PROG] || !tb[IOAM6_TRACE_GOB_BPF_PROG_NAME])
-		return -EINVAL;
-
-	nsdata = ioam6_pernet(genl_info_net(info));
-
-	mutex_lock(&nsdata->lock);
-
-	gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &id,
-				       rht_gob_sc_params);
-	if (gobsc) {
-		err = -EEXIST;
-		goto out_unlock;
-	}
-
-	gobsc = kzalloc(sizeof(*gobsc), GFP_KERNEL);
-	if (!gobsc) {
-		err = -ENOMEM;
-		goto out_unlock;
-	}
-
-	gobsc->id = id;
-	gobsc->bpf.name = nla_memdup(tb[IOAM6_TRACE_GOB_BPF_PROG_NAME],
-				     GFP_KERNEL);
-	if (!gobsc->bpf.name) {
-		err = -ENOMEM;
-		goto free_sc;
-	}
-
-	fd = nla_get_u32(tb[IOAM6_TRACE_GOB_BPF_PROG]);
-
-	p = bpf_prog_get_type(fd, BPF_PROG_TYPE_IOAM6_GOB);
-	if (IS_ERR(p)) {
-		err = PTR_ERR(p);
-		goto free_bpf_name;
-	}
-
-	gobsc->bpf.prog = p;
-
-	err = rhashtable_lookup_insert_fast(&nsdata->gob_schemas, &gobsc->head,
-					    rht_gob_sc_params);
-	if (err)
-		goto free_bpf_prog;
-
-out_unlock:
-	mutex_unlock(&nsdata->lock);
-	return err;
-free_bpf_prog:
-	bpf_prog_put(gobsc->bpf.prog);
-free_bpf_name:
-	kfree(gobsc->bpf.name);
-free_sc:
-	kfree(gobsc);
-	goto out_unlock;
-}
-
-static int ioam6_genl_del_gobsc(struct sk_buff *skb, struct genl_info *info)
-{
-	struct ioam6_pernet_data *nsdata;
-	struct ioam6_gob_schema *gobsc;
-	struct ioam6_namespace *ns;
-	int err;
-	u32 id;
-
-	if (!info->attrs[IOAM6_ATTR_GOB_SC_ID])
-		return -EINVAL;
-
-	id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
-	nsdata = ioam6_pernet(genl_info_net(info));
-
-	mutex_lock(&nsdata->lock);
-
-	gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &id,
-				       rht_gob_sc_params);
-	if (!gobsc) {
-		err = -ENOENT;
-		goto out_unlock;
-	}
-
-	err = rhashtable_remove_fast(&nsdata->gob_schemas, &gobsc->head,
-				     rht_gob_sc_params);
-	if (err)
-		goto out_unlock;
-
-	ns = rcu_dereference_protected(gobsc->ns,
-				       lockdep_is_held(&nsdata->lock));
-	if (ns)
-		rcu_assign_pointer(ns->gob_schema, NULL);
-
-	ioam6_gob_sc_release(gobsc);
-
-out_unlock:
-	mutex_unlock(&nsdata->lock);
-	return err;
-}
-
 static int ioam6_genl_ns_set_schema(struct sk_buff *skb, struct genl_info *info)
 {
 	struct ioam6_namespace *ns, *ns_ref;
@@ -882,65 +1143,6 @@ static int ioam6_genl_ns_set_schema(struct sk_buff *skb, struct genl_info *info)
 		if (ns_ref)
 			rcu_assign_pointer(ns_ref->schema, NULL);
 		rcu_assign_pointer(sc->ns, ns);
-	}
-
-	err = 0;
-
-out_unlock:
-	mutex_unlock(&nsdata->lock);
-	return err;
-}
-
-static int
-ioam6_genl_ns_set_gob_schema(struct sk_buff *skb, struct genl_info *info)
-{
-	struct ioam6_gob_schema *gobsc, *gobsc_ref;
-	struct ioam6_namespace *ns, *ns_ref;
-	struct ioam6_pernet_data *nsdata;
-	__be16 ns_id;
-	u32 gobsc_id;
-	int err;
-
-	if (!info->attrs[IOAM6_ATTR_NS_ID] ||
-	    (!info->attrs[IOAM6_ATTR_GOB_SC_ID] &&
-	     !info->attrs[IOAM6_ATTR_GOB_SC_NONE]))
-		return -EINVAL;
-
-	ns_id = cpu_to_be16(nla_get_u16(info->attrs[IOAM6_ATTR_NS_ID]));
-	nsdata = ioam6_pernet(genl_info_net(info));
-
-	mutex_lock(&nsdata->lock);
-
-	ns = rhashtable_lookup_fast(&nsdata->namespaces, &ns_id, rht_ns_params);
-	if (!ns) {
-		err = -ENOENT;
-		goto out_unlock;
-	}
-
-	if (info->attrs[IOAM6_ATTR_GOB_SC_NONE]) {
-		gobsc = NULL;
-	} else {
-		gobsc_id = nla_get_u32(info->attrs[IOAM6_ATTR_GOB_SC_ID]);
-		gobsc = rhashtable_lookup_fast(&nsdata->gob_schemas, &gobsc_id,
-					       rht_gob_sc_params);
-		if (!gobsc) {
-			err = -ENOENT;
-			goto out_unlock;
-		}
-	}
-
-	gobsc_ref = rcu_dereference_protected(ns->gob_schema,
-					      lockdep_is_held(&nsdata->lock));
-	if (gobsc_ref)
-		rcu_assign_pointer(gobsc_ref->ns, NULL);
-	rcu_assign_pointer(ns->gob_schema, gobsc);
-
-	if (gobsc) {
-		ns_ref = rcu_dereference_protected(gobsc->ns,
-						   lockdep_is_held(&nsdata->lock));
-		if (ns_ref)
-			rcu_assign_pointer(ns_ref->gob_schema, NULL);
-		rcu_assign_pointer(gobsc->ns, ns);
 	}
 
 	err = 0;
@@ -1007,6 +1209,7 @@ static const struct genl_ops ioam6_genl_ops[] = {
 		.policy	= ioam6_genl_policy_ns_sc,
 		.maxattr = ARRAY_SIZE(ioam6_genl_policy_ns_sc) - 1,
 	},
+#ifdef CONFIG_IPV6_IOAM6_GOB
 	{
 		.cmd	= IOAM6_CMD_ADD_GOB_SCHEMA,
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
@@ -1039,6 +1242,7 @@ static const struct genl_ops ioam6_genl_ops[] = {
 		.done	= ioam6_genl_dump_gobsc_done,
 		.flags	= GENL_ADMIN_PERM,
 	},
+#endif
 };
 
 #define IOAM6_GENL_EV_GRP_OFFSET 0
@@ -1133,6 +1337,19 @@ struct ioam6_namespace *ioam6_namespace(struct net *net, __be16 id)
 	struct ioam6_pernet_data *nsdata = ioam6_pernet(net);
 
 	return rhashtable_lookup_fast(&nsdata->namespaces, &id, rht_ns_params);
+}
+
+
+static __u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
+{
+	struct ioam6_trace_gob_hdr *gob_hdr;
+	int off = 0;
+
+	gob_hdr = ioam6_trace_gob_hdr_start(trace);
+	if (gob_hdr)
+		off = ioam6_trace_gob_len(gob_hdr);
+
+	return trace->data + off;
 }
 
 static void __ioam6_fill_trace_data(struct sk_buff *skb,
@@ -1364,113 +1581,6 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
 	}
 }
 
-static int
-ioam6_gob_run_prog(struct sk_buff *skb, struct ioam6_trace_gob_hdr *gob,
-		   struct bpf_prog *prog)
-{
-	u32 gob_schema = ioam6_trace_gob_schema(gob);
-	u32 gob_plen = ioam6_trace_gob_plen(gob);
-	u32 gob_len = sizeof(*gob) + gob_plen;
-	struct bpf_ioam6_trace_gob_ctx ctx;
-	int ret, err = 0;
-
-	/* initialize the bpf prog context */
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.len = gob_len;
-	ctx.schema = gob_schema;
-	ctx.data = (void *)gob->data;
-	ctx.data_end = ctx.data + gob_plen;
-	ctx.skb = skb;
-
-	/* XXX: compute the linear packet data range is not needed anymore.
-	 * We are not accessing the ctx->skb data directly but only using
-	 * dynptrs which don't require the cb->data_end/meta_data_end to be
-	 * set; in other words, the bpf_compute_data_pointers() et simila are
-	 * not required and this avoids to mangle/alter the skb's CB.
-	 */
-
-	/* Note that a IOAM6_GOB eBPF program cannot change the size of the
-	 * packet, and the ioam6 code already checked if the whole HBH was
-	 * writable or not. So in theory, we don't expect to clone or expand
-	 * the packet again, and thus change the skb pointers.
-	 * Moreover, this eBPF program does not allow to use helpers who mangle
-	 * the packet in a way that pointers to the skb must be invalidated.
-	 */
-	ret = bpf_prog_run_pin_on_cpu(prog, &ctx);
-	switch (ret) {
-	case BPF_OK:
-		break;
-	case BPF_DROP:
-		err = -EINVAL;
-		break;
-	default:
-		pr_warn_once("bpf-ioam6-gob: Illegal return value %d\n", ret);
-		err = -EFAULT;
-		break;
-	}
-
-	return err;
-}
-
-static bool ioam6_gob_schema_id_eq(u32 schema_a, u32 schema_b)
-{
-	return schema_a == schema_b;
-}
-
-/* called with rcu_read_lock(); assume that GOB header is present */
-static int
-__ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
-			    struct ioam6_trace_hdr *trace)
-{
-	struct ioam6_trace_gob_hdr *gob, *p;
-	struct ioam6_gob_schema *gobsc;
-	u32 schema_id, gob_len;
-
-	gobsc = rcu_dereference(ns->gob_schema);
-	if (!gobsc)
-		/* no GOB schema ID associated with this configuration; thus,
-		 * early return since we don't have any eBPF program to be run.
-		 */
-		return 0;
-
-	/* the IOAM has been check if is writable, e.g., is cloned if
-	 * needed or expanded as well, see@ ipv6_hop_ioam().
-	 * Thus, the GOB region must be in the linear part of the skb's data,
-	 * fail otherwise.
-	 */
-	gob = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, sizeof(*gob));
-	if (unlikely(!gob))
-		goto err;
-
-	/* GOB Schema is available, let's retrieve the GOB Schema ID associated
-	 * with this namespace and compare it with the Schema ID carried by the
-	 * GOB Header.
-	 */
-	schema_id = ioam6_trace_gob_schema(gob);
-	if (!ioam6_gob_schema_id_eq(schema_id, gobsc->id))
-		return 0;
-
-	/* check if the GOB region size is within the max limits or not */
-	gob_len = ioam6_trace_gob_len(gob);
-	if (unlikely(gob_len > IOAM6_TRACE_GOB_DATA_SIZE_MAX))
-		goto err;
-
-	/* check whether the *whole* GOB region is in the linear skb's data */
-	p = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, gob_len);
-	if (unlikely(p != gob))
-		goto err;
-
-	/* The GOB Header carries the same Schema ID active on the current node
-	 * (due to the binding to the current namespace).
-	 */
-	return ioam6_gob_run_prog(skb, gob, gobsc->bpf.prog);
-
-err:
-	/* received weird and/or malformed packet */
-	net_dbg_ratelimited("ioam6: invalid GOB header");
-	return -EINVAL;
-}
-
 /* called with rcu_read_lock() */
 int ioam6_fill_trace_data(struct sk_buff *skb,
 			  struct ioam6_namespace *ns,
@@ -1509,8 +1619,11 @@ int ioam6_fill_trace_data(struct sk_buff *skb,
 	trace->remlen -= trace->nodelen + sclen;
 
 out:
-	return ioam6_trace_gob_enabled(trace) ?
-		__ioam6_fill_gob_trace_data(skb, ns, trace): 0;
+#ifdef CONFIG_IPV6_IOAM6_GOB
+	if (ioam6_trace_gob_enabled(trace))
+		return __ioam6_fill_gob_trace_data(skb, ns, trace);
+#endif
+	return 0;
 }
 
 static int __net_init ioam6_net_init(struct net *net)
@@ -1533,14 +1646,15 @@ static int __net_init ioam6_net_init(struct net *net)
 	if (err)
 		goto free_rht_ns;
 
+#ifdef CONFIG_IPV6_IOAM6_GOB
 	err = rhashtable_init(&nsdata->gob_schemas, &rht_gob_sc_params);
-	if (err)
-		goto free_sc;
-
+	if (err) {
+		rhashtable_destroy(&nsdata->schemas);
+		goto free_rht_ns;
+	}
+#endif
 out:
 	return err;
-free_sc:
-	rhashtable_destroy(&nsdata->schemas);
 free_rht_ns:
 	rhashtable_destroy(&nsdata->namespaces);
 free_nsdata:
@@ -1555,101 +1669,17 @@ static void __net_exit ioam6_net_exit(struct net *net)
 
 	rhashtable_free_and_destroy(&nsdata->namespaces, ioam6_free_ns, NULL);
 	rhashtable_free_and_destroy(&nsdata->schemas, ioam6_free_sc, NULL);
+#ifdef CONFIG_IPV6_IOAM6_GOB
 	rhashtable_free_and_destroy(&nsdata->gob_schemas, ioam6_free_gob_sc,
 				    NULL);
+#endif
 
 	kfree(nsdata);
 }
 
-enum bpf_ioam6_gob_op {
-	BPF_IOAM6_GOB_OP_UNSPEC		= 0,
-	BPF_IOAM6_GOB_OP_READ,
-	BPF_IOAM6_GOB_OP_WRITE,
-};
-
-static struct ioam6_trace_gob_hdr *
-ioam6_trace_gob_hdr_from_bpf_ctx(struct bpf_ioam6_trace_gob_ctx *ctx)
-{
-	/* ctx->data points to the GOB payload, which is part of the GOB
-	 * header. By using container_of on ctx->data we can obtain the pointer
-	 * to the enclosing ioam6_trace_gob_hdr structure.
-	 */
-	return container_of(ctx->data, struct ioam6_trace_gob_hdr, data);
-}
-
-static int
-__bpf_ioam6_gob_common(struct bpf_ioam6_trace_gob_ctx *ctx, u32 offset,
-		       void *usrptr, u32 usrlen, enum bpf_ioam6_gob_op op)
-{
-	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_from_bpf_ctx(ctx);
-	const u32 gob_len = ctx->len;
-
-	/* don't need to check the lower bound as offset is always >= 0*/
-	if (offset + usrlen > gob_len)
-		/* out of bounds */
-		return -EFAULT;
-
-	switch (op) {
-	case BPF_IOAM6_GOB_OP_WRITE:
-		switch (offset) {
-		case bpf_ctx_range(struct ioam6_trace_gob_hdr, hdr):
-			/* at the moment the GOB header cannot be changed */
-			return -EINVAL;
-		default:
-			/* allowed to write in the payload */
-			break;
-		}
-
-		/* we already checked that the GOB is in the linear skb's data
-		 * part, as well as the packet is already cloned/expanded.
-		 */
-		memcpy((void *)gob + offset, usrptr, usrlen);
-		return 0;
-	case BPF_IOAM6_GOB_OP_READ:
-		/* the same as write for what concerns the skb linearity */
-		memcpy(usrptr, (const void *)gob + offset, usrlen);
-		return 0;
-	case BPF_IOAM6_GOB_OP_UNSPEC:
-		/* fallthrough */
-	default:
-		WARN_ON_ONCE(1);
-		return -EINVAL;
-	}
-}
-
-__bpf_kfunc_start_defs();
-
-__bpf_kfunc int
-bpf_ioam6_trace_gob_store_bytes(struct bpf_ioam6_trace_gob_ctx *ctx,
-				u32 offset, const void *from, u32 from__sz)
-{
-	return __bpf_ioam6_gob_common(ctx, offset, (void *)from, from__sz,
-				      BPF_IOAM6_GOB_OP_WRITE);
-}
-
-__bpf_kfunc int
-bpf_ioam6_trace_gob_load_bytes(struct bpf_ioam6_trace_gob_ctx *ctx,
-			       u32 offset, void *to, u32 to__sz)
-{
-	return __bpf_ioam6_gob_common(ctx, offset, to, to__sz,
-				      BPF_IOAM6_GOB_OP_READ);
-}
-
-__bpf_kfunc_end_defs();
-
-BTF_KFUNCS_START(ioam6_kfunc_fset)
-BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_store_bytes)
-BTF_ID_FLAGS(func, bpf_ioam6_trace_gob_load_bytes);
-BTF_KFUNCS_END(ioam6_kfunc_fset)
-
 static struct pernet_operations ioam6_net_ops = {
 	.init = ioam6_net_init,
 	.exit = ioam6_net_exit,
-};
-
-static const struct btf_kfunc_id_set ioam6_bpf_kfunc_set = {
-	.owner = THIS_MODULE,
-	.set   = &ioam6_kfunc_fset,
 };
 
 int __init ioam6_init(void)
@@ -1662,11 +1692,12 @@ int __init ioam6_init(void)
 	if (err)
 		goto out_unregister_pernet_subsys;
 
+#ifdef CONFIG_IPV6_IOAM6_GOB
 	err = register_btf_kfunc_id_set(BPF_PROG_TYPE_IOAM6_GOB,
 					&ioam6_bpf_kfunc_set);
 	if (err)
 		goto out_unregister_genl;
-
+#endif
 #ifdef CONFIG_IPV6_IOAM6_LWTUNNEL
 	err = ioam6_iptunnel_init();
 	if (err)
@@ -1677,9 +1708,10 @@ int __init ioam6_init(void)
 
 out:
 	return err;
-
+#if defined(CONFIG_IPV6_IOAM6_LWTUNNEL) || defined(CONFIG_IPV6_IOAM6_GOB)
 out_unregister_genl:
-	genl_unregister_family(&ioam6_genl_family);
+        genl_unregister_family(&ioam6_genl_family);
+#endif
 out_unregister_pernet_subsys:
 	unregister_pernet_subsys(&ioam6_net_ops);
 	goto out;

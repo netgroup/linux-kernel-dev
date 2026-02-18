@@ -340,4 +340,15 @@ config IPV6_IOAM6_LWTUNNEL
 
 	  If unsure, say N.
 
+config IPV6_IOAM6_GOB
+	bool "IPv6: IOAM Global Opaque Block (GOB) processing support"
+	depends on BPF_SYSCALL
+	help
+	  Support for the processing of the GOB header in IOAM
+	  Pre-allocated Trace Header.
+
+	  If unsure, say N.
+
+
+
 endif # IPV6

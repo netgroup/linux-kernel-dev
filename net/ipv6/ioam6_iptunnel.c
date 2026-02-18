@@ -217,6 +217,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 	}
 
 	if (gob_enabled) {
+#ifdef CONFIG_IPV6_IOAM6_GOB
 		int gob_paylen;
 
 		if (trace->type.gobver != 0x00) {
@@ -235,6 +236,10 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 		}
 
 		gob_len = sizeof(*gob_hdr) + gob_paylen;
+#else
+		NL_SET_ERR_MSG(extack, "Global-Opaque Block not supported");
+		return -EOPNOTSUPP;
+#endif
 	}
 
 	len_trace = trace->remlen * 4 + gob_len;
@@ -346,6 +351,7 @@ free_lwt:
 	return err;
 }
 
+#ifdef CONFIG_IPV6_IOAM6_GOB
 static void ioam6_fill_gob_hdr(struct net *net, struct sk_buff *skb,
 			       struct ioam6_namespace *ns,
 			       struct ioam6_trace_gob_hdr *gob)
@@ -378,6 +384,13 @@ static void ioam6_may_fill_gob_hdr(struct net *net, struct sk_buff *skb,
 	/* note that gob hdr is filled no matter of the ns existence */
 	ioam6_fill_gob_hdr(net, skb, ns, gob);
 }
+#else
+static void ioam6_may_fill_gob_hdr(struct net *net, struct sk_buff *skb,
+				   struct ioam6_namespace *ns,
+				   struct ioam6_trace_hdr *trace)
+{
+}
+#endif
 
 static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 {

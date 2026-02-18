@@ -22,7 +22,9 @@ struct ioam6_namespace {
 	struct rcu_head rcu;
 
 	struct ioam6_schema __rcu *schema;
+#ifdef CONFIG_IPV6_IOAM6_GOB
 	struct ioam6_gob_schema __rcu *gob_schema;
+#endif
 
 	__be16 id;
 	__be32 data;
@@ -61,7 +63,9 @@ struct ioam6_pernet_data {
 	struct mutex lock;
 	struct rhashtable namespaces;
 	struct rhashtable schemas;
+#ifdef CONFIG_IPV6_IOAM6_GOB
 	struct rhashtable gob_schemas;
+#endif
 };
 
 static inline struct ioam6_pernet_data *ioam6_pernet(struct net *net)
