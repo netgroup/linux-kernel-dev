@@ -134,7 +134,7 @@ static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
 static struct ioam6_trace_gob_hdr *
 ioam6_lwt_trace_gob_hdr(struct ioam6_lwt_encap *tuninfo)
 {
-	return ioam6_trace_gob_hdr_start(&tuninfo->traceh);
+	return ioam6_trace_gob_hdr_get(&tuninfo->ioamh);
 }
 
 static int ioam6_build_state(struct net *net, struct nlattr *nla,
@@ -313,18 +313,23 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 
 	tail = (void *)tuninfo->traceh.data;
 
-	if (gob_len) {
-		struct ioam6_trace_gob_hdr *_hdr;
-
-		/* GOB follows the per-node trace data */
-		_hdr = (struct ioam6_trace_gob_hdr*)tail;
-		memcpy(_hdr, gob_hdr, sizeof(*_hdr));
-
-		/* update the tail to the end of the GOB */
-		tail = (void *)_hdr + gob_len;
-	}
-
+	/* the node data space comes first, anchored at the data start per
+	 * RFC 9197, so that legacy transit nodes never reach the GOB.
+	 */
 	tail += trace->remlen * 4;
+
+	if (gob_len) {
+		struct ioam6_trace_gob_hdr *gob;
+
+		/* the GOB sits at the tail of the option. Only the GOB header
+		 * word is written here. The payload is left zeroed and gets
+		 * filled at runtime by the eBPF program.
+		 */
+		gob = ioam6_trace_gob_hdr_get(&tuninfo->ioamh);
+		gob->hdr = gob_hdr->hdr;
+
+		tail += gob_len;
+	}
 
 	if (len_aligned - len_trace) {
 		*(u8 *)tail = IPV6_TLV_PADN;
@@ -374,9 +379,9 @@ static void ioam6_fill_gob_hdr(struct net *net, struct sk_buff *skb,
 
 static void ioam6_may_fill_gob_hdr(struct net *net, struct sk_buff *skb,
 				   struct ioam6_namespace *ns,
-				   struct ioam6_trace_hdr *trace)
+				   struct ioam6_hdr *hdr)
 {
-	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_start(trace);
+	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_get(hdr);
 
 	if (!gob)
 		return;
@@ -387,7 +392,7 @@ static void ioam6_may_fill_gob_hdr(struct net *net, struct sk_buff *skb,
 #else
 static void ioam6_may_fill_gob_hdr(struct net *net, struct sk_buff *skb,
 				   struct ioam6_namespace *ns,
-				   struct ioam6_trace_hdr *trace)
+				   struct ioam6_hdr *hdr)
 {
 }
 #endif
@@ -396,14 +401,15 @@ static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
 {
 	struct ioam6_trace_hdr *trace;
 	struct ioam6_namespace *ns;
+	struct ioam6_hdr *hdr;
 
-	trace = (struct ioam6_trace_hdr *)(skb_transport_header(skb)
-					   + sizeof(struct ipv6_hopopt_hdr) + 2
-					   + sizeof(struct ioam6_hdr));
+	hdr = (struct ioam6_hdr *)(skb_transport_header(skb)
+				   + sizeof(struct ipv6_hopopt_hdr) + 2);
+	trace = ioam6_opt_to_trace(hdr);
 
 	ns = ioam6_namespace(net, trace->namespace_id);
 
-	ioam6_may_fill_gob_hdr(net, skb, ns, trace);
+	ioam6_may_fill_gob_hdr(net, skb, ns, hdr);
 
 	return ns ? ioam6_fill_trace_data(skb, ns, trace, false) : 0;
 }
@@ -657,7 +663,7 @@ static int ioam6_fill_encap_info(struct sk_buff *skb,
 	if (err)
 		goto ret;
 
-	/* Global-Unique trace block is set */
+	/* Global-Opaque Block is set */
 	gobh = ioam6_lwt_trace_gob_hdr(&ilwt->tuninfo);
 	if (!gobh)
 		return 0;

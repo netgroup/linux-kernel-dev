@@ -92,17 +92,50 @@ static inline bool ioam6_trace_gob_enabled(struct ioam6_trace_hdr *trace)
 	return !!trace->type.gob;
 }
 
-static inline struct ioam6_trace_gob_hdr *
-__ioam6_trace_gob_hdr_start_nocheck(struct ioam6_trace_hdr *trace)
+/*
+ * IOAM Pre-allocated Trace Option layout inside the IPv6 Hop-by-Hop
+ * options. The option header (ioam6_hdr) always immediately precedes
+ * the trace header (ioam6_trace_hdr):
+ *
+ *   +----------------+----------------------+--------------------------+
+ *   | ioam6_hdr (4B) | ioam6_trace_hdr (8B) | data[]: node data | GOB  |
+ *   +----------------+----------------------+--------------------------+
+ *   ^                ^
+ *   opt              trace   (trace == opt + 1,  opt == trace - 1)
+ *
+ * opt   : opt_type, opt_len, reserved, IOAM Option-Type (the TLV header).
+ * trace : namespace_id, nodelen, remlen, trace-type, then data[].
+ */
+static inline struct ioam6_trace_hdr *
+ioam6_opt_to_trace(struct ioam6_hdr *opt)
 {
-	return (struct ioam6_trace_gob_hdr *)trace->data;
+	return (struct ioam6_trace_hdr *)(opt + 1);
+}
+
+static inline struct ioam6_hdr *
+ioam6_trace_to_opt(struct ioam6_trace_hdr *trace)
+{
+	return (struct ioam6_hdr *)trace - 1;
 }
 
 static inline struct ioam6_trace_gob_hdr *
-ioam6_trace_gob_hdr_start(struct ioam6_trace_hdr *trace)
+ioam6_trace_gob_hdr_get(struct ioam6_hdr *hdr)
 {
-	return ioam6_trace_gob_enabled(trace) ?
-		__ioam6_trace_gob_hdr_start_nocheck(trace) : NULL;
+	struct ioam6_trace_hdr *trace = ioam6_opt_to_trace(hdr);
+	struct ioam6_trace_gob_hdr *gob;
+	u8 *opt_end;
+
+	if (!ioam6_trace_gob_enabled(trace))
+		return NULL;
+
+	/* opt_len counts the bytes after opt_type and opt_len (2B). The PadN
+	 * stays outside the option, so opt_len ends right at the GOB header,
+	 * which is the last 4-byte word of the option.
+	 */
+	opt_end = (u8 *)hdr + 2 + hdr->opt_len;
+	gob = (struct ioam6_trace_gob_hdr *)(opt_end - sizeof(*gob));
+
+	return gob;
 }
 
 static inline u32 ioam6_trace_gob_plen(struct ioam6_trace_gob_hdr *gob_hdr)

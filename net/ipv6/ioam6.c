@@ -44,17 +44,11 @@ static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 	return off;
 }
 
-static struct ioam6_trace_gob_hdr *
-__ioam6_trace_gob_hdr_pointer_if_linear(struct sk_buff *skb,
-					struct ioam6_trace_hdr *trace,
-					int offset)
+static bool
+ioam6_range_is_linear(struct sk_buff *skb, void *ptr, int len)
 {
-	/* when GOB is present, it always starts at the end of the trace
-	 * header, before the Node-data list.
-	 */
-	int gob_off = ptroff_by_skb_data(skb, trace->data);
-
-	return skb_pointer_if_linear(skb, gob_off, offset);
+	/* true if [ptr, ptr + len) is in the linear skb data */
+	return skb_pointer_if_linear(skb, ptroff_by_skb_data(skb, ptr), len);
 }
 
 static void ioam6_gob_sc_free_callback_rcu(struct rcu_head *head)
@@ -424,6 +418,21 @@ out_unlock:
 	return err;
 }
 
+static u8 *ioam6_trace_gob_payload(struct ioam6_trace_gob_hdr *gob_hdr)
+{
+	/* In the tail layout the GOB payload precedes the header word, so it
+	 * starts plen (= GOB_Len * 4) bytes before gob_hdr:
+	 *
+	 *   +--------------------+-----------------+
+	 *   | GOB payload (plen) | GOB header (4B) |
+	 *   +--------------------+-----------------+
+	 *   ^                    ^
+	 *   payload              gob_hdr
+	 *   (gob_hdr - plen)
+	 */
+	return (u8 *)gob_hdr - ioam6_trace_gob_plen(gob_hdr);
+}
+
 static int
 ioam6_gob_run_prog(struct sk_buff *skb, struct ioam6_trace_gob_hdr *gob,
 		   struct bpf_prog *prog)
@@ -438,7 +447,7 @@ ioam6_gob_run_prog(struct sk_buff *skb, struct ioam6_trace_gob_hdr *gob,
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.len = gob_len;
 	ctx.schema = gob_schema;
-	ctx.data = (void *)gob->data;
+	ctx.data = ioam6_trace_gob_payload(gob);
 	ctx.data_end = ctx.data + gob_plen;
 	ctx.skb = skb;
 
@@ -482,9 +491,12 @@ static int
 __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 			    struct ioam6_trace_hdr *trace)
 {
-	struct ioam6_trace_gob_hdr *gob, *p;
+	struct ioam6_hdr *hdr = ioam6_trace_to_opt(trace);
+	bool hdr_linear, gob_linear, schema_match;
+	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_gob_schema *gobsc;
 	u32 schema_id, gob_len;
+	void *payload;
 
 	gobsc = rcu_dereference(ns->gob_schema);
 	if (!gobsc)
@@ -493,13 +505,18 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 		 */
 		return 0;
 
+	/* the GOB header sits at the tail of the option */
+	gob = ioam6_trace_gob_hdr_get(hdr);
+	if (unlikely(!gob))
+		goto err;
+
 	/* the IOAM has been check if is writable, e.g., is cloned if
 	 * needed or expanded as well, see@ ipv6_hop_ioam().
-	 * Thus, the GOB region must be in the linear part of the skb's data,
-	 * fail otherwise.
+	 * Thus, the GOB header word must be in the linear part of the skb's
+	 * data before we read it, fail otherwise.
 	 */
-	gob = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, sizeof(*gob));
-	if (unlikely(!gob))
+	hdr_linear = ioam6_range_is_linear(skb, gob, sizeof(*gob));
+	if (unlikely(!hdr_linear))
 		goto err;
 
 	/* GOB Schema is available, let's retrieve the GOB Schema ID associated
@@ -507,7 +524,8 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	 * GOB Header.
 	 */
 	schema_id = ioam6_trace_gob_schema(gob);
-	if (!ioam6_gob_schema_id_eq(schema_id, gobsc->id))
+	schema_match = ioam6_gob_schema_id_eq(schema_id, gobsc->id);
+	if (!schema_match)
 		return 0;
 
 	/* check if the GOB region size is within the max limits or not */
@@ -515,9 +533,12 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 	if (unlikely(gob_len > IOAM6_TRACE_GOB_DATA_SIZE_MAX))
 		goto err;
 
-	/* check whether the *whole* GOB region is in the linear skb's data */
-	p = __ioam6_trace_gob_hdr_pointer_if_linear(skb, trace, gob_len);
-	if (unlikely(p != gob))
+	/* check whether the *whole* GOB region is in the linear skb's data.
+	 * The payload precedes the header word.
+	 */
+	payload = ioam6_trace_gob_payload(gob);
+	gob_linear = ioam6_range_is_linear(skb, payload, gob_len);
+	if (unlikely(!gob_linear))
 		goto err;
 
 	/* The GOB Header carries the same Schema ID active on the current node
@@ -537,47 +558,29 @@ enum bpf_ioam6_gob_op {
 	BPF_IOAM6_GOB_OP_WRITE,
 };
 
-static struct ioam6_trace_gob_hdr *
-ioam6_trace_gob_hdr_from_bpf_ctx(struct bpf_ioam6_trace_gob_ctx *ctx)
-{
-	/* ctx->data points to the GOB payload, which is part of the GOB
-	 * header. By using container_of on ctx->data we can obtain the pointer
-	 * to the enclosing ioam6_trace_gob_hdr structure.
-	 */
-	return container_of(ctx->data, struct ioam6_trace_gob_hdr, data);
-}
-
 static int
 __bpf_ioam6_gob_common(struct bpf_ioam6_trace_gob_ctx *ctx, u32 offset,
 		       void *usrptr, u32 usrlen, enum bpf_ioam6_gob_op op)
 {
-	struct ioam6_trace_gob_hdr *gob = ioam6_trace_gob_hdr_from_bpf_ctx(ctx);
-	const u32 gob_len = ctx->len;
+	const u32 plen = ctx->len - sizeof(struct ioam6_trace_gob_hdr);
+	void *target;
 
-	/* don't need to check the lower bound as offset is always >= 0*/
-	if (offset + usrlen > gob_len)
+	/* offset is relative to the GOB payload. The header is not
+	 * addressable here and is never writable. The payload is in the
+	 * linear skb data part, already cloned/expanded if needed.
+	 */
+	if (offset + usrlen > plen)
 		/* out of bounds */
 		return -EFAULT;
 
+	target = (u8 *)ctx->data + offset;
+
 	switch (op) {
 	case BPF_IOAM6_GOB_OP_WRITE:
-		switch (offset) {
-		case bpf_ctx_range(struct ioam6_trace_gob_hdr, hdr):
-			/* at the moment the GOB header cannot be changed */
-			return -EINVAL;
-		default:
-			/* allowed to write in the payload */
-			break;
-		}
-
-		/* we already checked that the GOB is in the linear skb's data
-		 * part, as well as the packet is already cloned/expanded.
-		 */
-		memcpy((void *)gob + offset, usrptr, usrlen);
+		memcpy(target, usrptr, usrlen);
 		return 0;
 	case BPF_IOAM6_GOB_OP_READ:
-		/* the same as write for what concerns the skb linearity */
-		memcpy(usrptr, (const void *)gob + offset, usrlen);
+		memcpy(usrptr, target, usrlen);
 		return 0;
 	case BPF_IOAM6_GOB_OP_UNSPEC:
 		/* fallthrough */
@@ -1256,8 +1259,8 @@ static int ioam6_event_put_trace(struct sk_buff *skb,
 				 struct ioam6_trace_hdr *trace,
 				 unsigned int len)
 {
+	struct ioam6_hdr *hdr = ioam6_trace_to_opt(trace);
 	struct ioam6_trace_gob_hdr *gob;
-	__u8 *trace_data = trace->data;
 	int gob_len = 0;
 
 	if (nla_put_u16(skb, IOAM6_EVENT_ATTR_TRACE_NAMESPACE,
@@ -1267,15 +1270,13 @@ static int ioam6_event_put_trace(struct sk_buff *skb,
 			be32_to_cpu(trace->type_be32)))
 		return 1;
 
-	gob = ioam6_trace_gob_hdr_start(trace);
-	if (gob) {
+	gob = ioam6_trace_gob_hdr_get(hdr);
+	if (gob)
 		gob_len = ioam6_trace_gob_len(gob);
-		trace_data = trace->data + gob_len;
-	}
 
 	if (nla_put(skb, IOAM6_EVENT_ATTR_TRACE_DATA,
 		    len - sizeof(struct ioam6_trace_hdr) - gob_len -
-		    trace->remlen * 4, trace_data + trace->remlen * 4))
+		    trace->remlen * 4, trace->data + trace->remlen * 4))
 		return 1;
 
 	return 0;
@@ -1340,16 +1341,13 @@ struct ioam6_namespace *ioam6_namespace(struct net *net, __be16 id)
 }
 
 
-static __u8* ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
+static __u8 *ioam6_trace_data_get(struct ioam6_trace_hdr *trace)
 {
-	struct ioam6_trace_gob_hdr *gob_hdr;
-	int off = 0;
-
-	gob_hdr = ioam6_trace_gob_hdr_start(trace);
-	if (gob_hdr)
-		off = ioam6_trace_gob_len(gob_hdr);
-
-	return trace->data + off;
+	/* the node data space is anchored at the start of the trace data,
+	 * per RFC 9197. The GOB, when present, sits at the tail of the
+	 * option and is never reached by the node data recording.
+	 */
+	return trace->data;
 }
 
 static void __ioam6_fill_trace_data(struct sk_buff *skb,

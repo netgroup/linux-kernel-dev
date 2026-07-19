@@ -929,9 +929,9 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
 			goto drop;
 
 		/* Malformed Pre-allocated Trace header */
-		trace = (struct ioam6_trace_hdr *)((u8 *)hdr + sizeof(*hdr));
+		trace = ioam6_opt_to_trace(hdr);
 
-		gob = ioam6_trace_gob_hdr_start(trace);
+		gob = ioam6_trace_gob_hdr_get(hdr);
 		if (gob) {
 			/* Let's check GOB boundaries */
 			if (hdr->opt_len < 2 + sizeof(*trace) + sizeof(*gob))
