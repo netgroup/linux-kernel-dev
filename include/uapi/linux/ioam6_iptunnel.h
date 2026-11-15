@@ -58,6 +58,13 @@ enum {
 
 	IOAM6_IPTUNNEL_TRACE_GOB,	/* struct ioam6_trace_gob_hdr */
 
+	/* Namespace-implied GOB: payload size in octets. The GOB is
+	 * allocated at the tail of the option without any trailer and the
+	 * G bit is left unset.
+	 * Mutually exclusive with IOAM6_IPTUNNEL_TRACE_GOB.
+	 */
+	IOAM6_IPTUNNEL_TRACE_GOB_IMPLIED,	/* u8 */
+
 	__IOAM6_IPTUNNEL_MAX,
 };
 

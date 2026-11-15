@@ -902,11 +902,10 @@ static bool ipv6_hop_ra(struct sk_buff *skb, int optoff)
 
 static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
 {
-	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_trace_hdr *trace;
 	struct ioam6_namespace *ns;
+	struct ioam6_gob_desc gob;
 	struct ioam6_hdr *hdr;
-	int gob_len = 0;
 	int ret = 0;
 
 	/* Bad alignment (must be 4n-aligned) */
@@ -930,25 +929,26 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
 
 		/* Malformed Pre-allocated Trace header */
 		trace = ioam6_opt_to_trace(hdr);
-
-		gob = ioam6_trace_gob_hdr_get(hdr);
-		if (gob) {
-			/* Let's check GOB boundaries */
-			if (hdr->opt_len < 2 + sizeof(*trace) + sizeof(*gob))
-				goto drop;
-
-			/* GOB is made of the header + the payload */
-			gob_len = sizeof(*gob) + ioam6_trace_gob_plen(gob);
-		}
-
-		if (hdr->opt_len < 2 +
-		    sizeof(*trace) + gob_len + trace->remlen * 4)
+		if (hdr->opt_len < 2 + sizeof(*trace) + trace->remlen * 4)
 			goto drop;
 
 		/* Ignore if the IOAM namespace is unknown */
 		ns = ioam6_namespace(dev_net(skb->dev), trace->namespace_id);
 		if (!ns)
 			goto ignore;
+
+		/* The GOB is located through the namespace first (a namespace
+		 * may imply a trailer-less GOB) and through the G bit only
+		 * afterwards: this is why the GOB boundaries are checked after
+		 * the namespace lookup.
+		 * A trailer-based GOB that does not fit in the option makes
+		 * the packet inconsistent with itself: drop it. An implied GOB
+		 * that does not fit is a mismatch between the packet and the
+		 * local configuration: the GOB is left alone and the option is
+		 * processed as a plain Pre-allocated Trace.
+		 */
+		if (ioam6_trace_gob_resolve(ns, hdr, trace->remlen, &gob))
+			goto drop;
 
 		if (!skb_valid_dst(skb))
 			ip6_route_input(skb);
@@ -957,14 +957,17 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
 		if (skb_ensure_writable(skb, optoff + 2 + hdr->opt_len))
 			goto drop;
 
-		/* Trace pointer may have changed */
-		trace = (struct ioam6_trace_hdr *)(skb_network_header(skb)
-						   + optoff + sizeof(*hdr));
+		/* Header pointers may have changed; the pointers in the GOB
+		 * descriptor are stale as well, only its length is used below.
+		 */
+		hdr = (struct ioam6_hdr *)(skb_network_header(skb) + optoff);
+		trace = ioam6_opt_to_trace(hdr);
 
 		ret = ioam6_fill_trace_data(skb, ns, trace, true);
 
 		ioam6_event(IOAM6_EVENT_TRACE, dev_net(skb->dev),
-			    GFP_ATOMIC, (void *)trace, hdr->opt_len - 2);
+			    GFP_ATOMIC, (void *)trace, hdr->opt_len - 2,
+			    gob.len);
 
 		/* depending on the outcome of the ioam6_fill_trace_data() we
 		 * decide what to do w/ this packet. The only reason this

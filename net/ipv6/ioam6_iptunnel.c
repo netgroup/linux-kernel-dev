@@ -46,6 +46,7 @@ struct ioam6_lwt {
 	struct ioam6_lwt_freq freq;
 	atomic_t pkt_cnt;
 	u8 mode;
+	u8 gob_implied;		/* namespace-implied GOB size, 0 if none */
 	bool has_tunsrc;
 	struct in6_addr tunsrc;
 	struct in6_addr tundst;
@@ -84,14 +85,20 @@ static const struct nla_policy ioam6_iptunnel_policy[IOAM6_IPTUNNEL_MAX + 1] = {
 					sizeof(struct ioam6_trace_hdr)),
 	[IOAM6_IPTUNNEL_TRACE_GOB] = NLA_POLICY_EXACT_LEN(
 					sizeof(struct ioam6_trace_gob_hdr)),
+	[IOAM6_IPTUNNEL_TRACE_GOB_IMPLIED] =
+		NLA_POLICY_RANGE(NLA_U8, 4, IOAM6_TRACE_GOB_DATA_SIZE_MAX),
 };
 
-static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace)
+/* @gob_implied: a namespace-implied GOB is requested. It is a GOB like the
+ * trailer-based one signalled by the G bit, except that the G bit is unset.
+ */
+static bool ioam6_validate_trace_hdr(struct ioam6_trace_hdr *trace,
+				     bool gob_implied)
 {
 	__be32 type_be32 = trace->type_be32;
 	u32 fields = be32_to_cpu(type_be32);
 
-	if (ioam6_trace_gob_enabled(trace)) {
+	if (ioam6_trace_gob_enabled(trace) || gob_implied) {
 		/* remove the GOB fields from the fields */
 		bool fields_nogob = !!(fields & ~0x7U);
 		bool nonzero_remlen = !!trace->remlen;
@@ -153,6 +160,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 	int ioamh_optlen;
 	bool gob_enabled;
 	int gob_len = 0;
+	u8 gob_implied;
 	int len_trace;
 	int total_len;
 	u8 *tail;
@@ -203,7 +211,10 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 
 	trace = nla_data(tb[IOAM6_IPTUNNEL_TRACE]);
 
-	if (!ioam6_validate_trace_hdr(trace)) {
+	gob_implied = nla_get_u8_default(tb[IOAM6_IPTUNNEL_TRACE_GOB_IMPLIED],
+					 0);
+
+	if (!ioam6_validate_trace_hdr(trace, !!gob_implied)) {
 		NL_SET_ERR_MSG_ATTR(extack, tb[IOAM6_IPTUNNEL_TRACE],
 				    "invalid trace validation");
 		return -EINVAL;
@@ -242,6 +253,50 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 #endif
 	}
 
+	if (gob_implied) {
+#ifdef CONFIG_IPV6_IOAM6_GOB
+		struct ioam6_namespace *ns;
+		bool ns_mismatch;
+
+		/* Namespace-implied GOB: payload only, no trailer. The G bit
+		 * signals the trailer-based GOB and is never set in this mode
+		 * (this also rules out IOAM6_IPTUNNEL_TRACE_GOB, see above).
+		 */
+		if (gob_enabled) {
+			NL_SET_ERR_MSG(extack,
+				       "namespace-implied Global-Opaque Block cannot be used with the G bit");
+			return -EINVAL;
+		}
+
+		if (gob_implied % 4) {
+			NL_SET_ERR_MSG(extack,
+				       "namespace-implied Global-Opaque Block length is not valid");
+			return -EINVAL;
+		}
+
+		/* If the namespace is already known on this node, it must
+		 * imply a GOB of this very size. Note that this is checked
+		 * here only: a later change of the namespace is not reflected
+		 * on this state.
+		 */
+		rcu_read_lock();
+		ns = ioam6_namespace(net, trace->namespace_id);
+		ns_mismatch = ns && ioam6_ns_gob_implied_len(ns) != gob_implied;
+		rcu_read_unlock();
+
+		if (ns_mismatch) {
+			NL_SET_ERR_MSG(extack,
+				       "namespace does not imply a Global-Opaque Block of this size");
+			return -EINVAL;
+		}
+
+		gob_len = gob_implied;
+#else
+		NL_SET_ERR_MSG(extack, "Global-Opaque Block not supported");
+		return -EOPNOTSUPP;
+#endif
+	}
+
 	len_trace = trace->remlen * 4 + gob_len;
 	WARN_ON_ONCE(!len_trace);
 
@@ -268,6 +323,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 	ilwt->freq.n = freq_n;
 
 	ilwt->mode = mode;
+	ilwt->gob_implied = gob_implied;
 
 	if (!tb[IOAM6_IPTUNNEL_SRC]) {
 		ilwt->has_tunsrc = false;
@@ -319,14 +375,18 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
 	tail += trace->remlen * 4;
 
 	if (gob_len) {
-		struct ioam6_trace_gob_hdr *gob;
-
 		/* the GOB sits at the tail of the option. Only the GOB header
-		 * word is written here. The payload is left zeroed and gets
-		 * filled at runtime by the eBPF program.
+		 * word is written here, and only in the default mode: a
+		 * namespace-implied GOB has no header word at all. The payload
+		 * is left zeroed and gets filled at runtime by the eBPF
+		 * program.
 		 */
-		gob = ioam6_trace_gob_hdr_get(&tuninfo->ioamh);
-		gob->hdr = gob_hdr->hdr;
+		if (gob_enabled) {
+			struct ioam6_trace_gob_hdr *gob;
+
+			gob = ioam6_trace_gob_hdr_get(&tuninfo->ioamh);
+			gob->hdr = gob_hdr->hdr;
+		}
 
 		tail += gob_len;
 	}
@@ -665,10 +725,17 @@ static int ioam6_fill_encap_info(struct sk_buff *skb,
 
 	/* Global-Opaque Block is set */
 	gobh = ioam6_lwt_trace_gob_hdr(&ilwt->tuninfo);
-	if (!gobh)
-		return 0;
+	if (gobh) {
+		err = nla_put(skb, IOAM6_IPTUNNEL_TRACE_GOB, sizeof(*gobh),
+			      gobh);
+		if (err)
+			goto ret;
+	}
 
-	err = nla_put(skb, IOAM6_IPTUNNEL_TRACE_GOB, sizeof(*gobh), gobh);
+	/* namespace-implied Global-Opaque Block is set */
+	if (ilwt->gob_implied)
+		err = nla_put_u8(skb, IOAM6_IPTUNNEL_TRACE_GOB_IMPLIED,
+				 ilwt->gob_implied);
 
 ret:
 	return err;
@@ -692,6 +759,9 @@ static int ioam6_encap_nlsize(struct lwtunnel_state *lwtstate)
 	gob = ioam6_lwt_trace_gob_hdr(&ilwt->tuninfo);
 	nlsize += gob ? sizeof(*gob) : 0;
 
+	if (ilwt->gob_implied)
+		nlsize += nla_total_size(sizeof(ilwt->gob_implied));
+
 	if (ilwt->mode != IOAM6_IPTUNNEL_MODE_INLINE) {
 		if (ilwt->has_tunsrc)
 			nlsize += nla_total_size(sizeof(ilwt->tunsrc));
@@ -712,6 +782,7 @@ static int ioam6_encap_cmp(struct lwtunnel_state *a, struct lwtunnel_state *b)
 	return (ilwt_a->freq.k != ilwt_b->freq.k ||
 		ilwt_a->freq.n != ilwt_b->freq.n ||
 		ilwt_a->mode != ilwt_b->mode ||
+		ilwt_a->gob_implied != ilwt_b->gob_implied ||
 		ilwt_a->has_tunsrc != ilwt_b->has_tunsrc ||
 		(ilwt_a->mode != IOAM6_IPTUNNEL_MODE_INLINE &&
 		 !ipv6_addr_equal(&ilwt_a->tundst, &ilwt_b->tundst)) ||

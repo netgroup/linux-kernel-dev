@@ -30,11 +30,6 @@
 
 static struct genl_family ioam6_genl_family;
 
-static int ioam6_trace_gob_len(struct ioam6_trace_gob_hdr *gob_hdr)
-{
-	return sizeof(*gob_hdr) + ioam6_trace_gob_plen(gob_hdr);
-}
-
 #ifdef CONFIG_IPV6_IOAM6_GOB
 static int ptroff_by_skb_data(struct sk_buff *skb, void *ptr)
 {
@@ -113,6 +108,8 @@ static const struct nla_policy ioam6_genl_policy_ns_gob_sc[] = {
 	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
 	[IOAM6_ATTR_GOB_SC_ID]	= { .type = NLA_U32 },
 	[IOAM6_ATTR_GOB_SC_NONE] = { .type = NLA_FLAG },
+	[IOAM6_ATTR_GOB_IMPLIED_LEN] =
+		NLA_POLICY_MAX(NLA_U8, IOAM6_TRACE_GOB_DATA_SIZE_MAX),
 };
 
 static void ioam6_genl_delns_gob_cleanup(struct ioam6_pernet_data *nsdata,
@@ -131,8 +128,15 @@ __ioam6_genl_dumpns_element_gob_rcu(struct ioam6_namespace *ns,
 				    struct sk_buff *skb)
 {
 	struct ioam6_gob_schema *gobsc = rcu_dereference(ns->gob_schema);
+	u8 implied = ioam6_ns_gob_implied_len(ns);
 
-	return gobsc ? nla_put_u32(skb, IOAM6_ATTR_GOB_SC_ID, gobsc->id) : 0;
+	if (gobsc && nla_put_u32(skb, IOAM6_ATTR_GOB_SC_ID, gobsc->id))
+		return -EMSGSIZE;
+
+	if (implied && nla_put_u8(skb, IOAM6_ATTR_GOB_IMPLIED_LEN, implied))
+		return -EMSGSIZE;
+
+	return 0;
 }
 
 static int __ioam6_genl_dump_gobsc_element(struct ioam6_gob_schema *gobsc,
@@ -367,11 +371,22 @@ ioam6_genl_ns_set_gob_schema(struct sk_buff *skb, struct genl_info *info)
 	struct ioam6_pernet_data *nsdata;
 	__be16 ns_id;
 	u32 gobsc_id;
+	u8 implied;
 	int err;
 
 	if (!info->attrs[IOAM6_ATTR_NS_ID] ||
 	    (!info->attrs[IOAM6_ATTR_GOB_SC_ID] &&
 	     !info->attrs[IOAM6_ATTR_GOB_SC_NONE]))
+		return -EINVAL;
+
+	/* Namespace-implied GOB: the size of the GOB payload is bound to the
+	 * namespace together with the schema, so that the two are applied
+	 * under the same lock. Without the attribute the namespace is in the
+	 * default (trailer-based) mode.
+	 */
+	implied = nla_get_u8_default(info->attrs[IOAM6_ATTR_GOB_IMPLIED_LEN],
+				     0);
+	if (implied % 4)
 		return -EINVAL;
 
 	ns_id = cpu_to_be16(nla_get_u16(info->attrs[IOAM6_ATTR_NS_ID]));
@@ -411,6 +426,8 @@ ioam6_genl_ns_set_gob_schema(struct sk_buff *skb, struct genl_info *info)
 		rcu_assign_pointer(gobsc->ns, ns);
 	}
 
+	WRITE_ONCE(ns->gob_implied_len, implied);
+
 	err = 0;
 
 out_unlock:
@@ -418,37 +435,30 @@ out_unlock:
 	return err;
 }
 
-static u8 *ioam6_trace_gob_payload(struct ioam6_trace_gob_hdr *gob_hdr)
-{
-	/* In the tail layout the GOB payload precedes the header word, so it
-	 * starts plen (= GOB_Len * 4) bytes before gob_hdr:
-	 *
-	 *   +--------------------+-----------------+
-	 *   | GOB payload (plen) | GOB header (4B) |
-	 *   +--------------------+-----------------+
-	 *   ^                    ^
-	 *   payload              gob_hdr
-	 *   (gob_hdr - plen)
-	 */
-	return (u8 *)gob_hdr - ioam6_trace_gob_plen(gob_hdr);
-}
-
 static int
-ioam6_gob_run_prog(struct sk_buff *skb, struct ioam6_trace_gob_hdr *gob,
-		   struct bpf_prog *prog)
+ioam6_gob_run_prog(struct sk_buff *skb, const struct ioam6_gob_desc *gob,
+		   u32 gob_schema, struct bpf_prog *prog)
 {
-	u32 gob_schema = ioam6_trace_gob_schema(gob);
-	u32 gob_plen = ioam6_trace_gob_plen(gob);
-	u32 gob_len = sizeof(*gob) + gob_plen;
 	struct bpf_ioam6_trace_gob_ctx ctx;
 	int ret, err = 0;
 
-	/* initialize the bpf prog context */
+	/* initialize the bpf prog context. Only the GOB payload is exposed:
+	 * in the tail layout it precedes the GOB trailer, when there is one
+	 * (default mode); in the namespace-implied mode it is the whole GOB.
+	 *
+	 *   +--------------------+------------------+
+	 *   | GOB payload (plen) | GOB trailer (4B) |   default mode
+	 *   +--------------------+------------------+
+	 *   | GOB payload (plen) |                      namespace-implied mode
+	 *   +--------------------+
+	 *   ^
+	 *   payload
+	 */
 	memset(&ctx, 0, sizeof(ctx));
-	ctx.len = gob_len;
+	ctx.len = gob->plen;
 	ctx.schema = gob_schema;
-	ctx.data = ioam6_trace_gob_payload(gob);
-	ctx.data_end = ctx.data + gob_plen;
+	ctx.data = gob->payload;
+	ctx.data_end = ctx.data + gob->plen;
 	ctx.skb = skb;
 
 	/* XXX: compute the linear packet data range is not needed anymore.
@@ -486,17 +496,48 @@ static bool ioam6_gob_schema_id_eq(u32 schema_a, u32 schema_b)
 	return schema_a == schema_b;
 }
 
-/* called with rcu_read_lock(); assume that GOB header is present */
+/* called with rcu_read_lock(). @remlen is the RemainingLen the option was
+ * received (or built) with, i.e. before this node recorded its node data.
+ */
 static int
 __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
-			    struct ioam6_trace_hdr *trace)
+			    struct ioam6_trace_hdr *trace, u8 remlen)
 {
 	struct ioam6_hdr *hdr = ioam6_trace_to_opt(trace);
-	bool hdr_linear, gob_linear, schema_match;
-	struct ioam6_trace_gob_hdr *gob;
 	struct ioam6_gob_schema *gobsc;
-	u32 schema_id, gob_len;
-	void *payload;
+	struct ioam6_gob_desc gob;
+	u32 schema_id;
+
+	/* fast path: neither an implied GOB nor a trailer-based one */
+	if (!ioam6_ns_gob_implied_len(ns) && !ioam6_trace_gob_enabled(trace))
+		return 0;
+
+	/* the IOAM has been check if is writable, e.g., is cloned if
+	 * needed or expanded as well, see@ ipv6_hop_ioam().
+	 * Thus, the whole option (GOB included) must be in the linear part of
+	 * the skb's data before we read it, fail otherwise.
+	 */
+	if (unlikely(!ioam6_range_is_linear(skb, hdr, 2 + hdr->opt_len)))
+		goto err;
+
+	/* the GOB sits at the tail of the option: the namespace tells whether
+	 * it is an implied one (payload only), otherwise the G bit tells
+	 * whether there is a trailer-based one.
+	 */
+	if (unlikely(ioam6_trace_gob_resolve(ns, hdr, remlen, &gob)))
+		goto err;
+
+	if (gob.mode == IOAM6_GOB_MODE_NONE) {
+		/* The namespace implies a GOB but the option has no room for
+		 * it: the packet does not match the local configuration. Do
+		 * not touch the GOB, the packet goes on as a plain
+		 * Pre-allocated Trace.
+		 */
+		if (unlikely(gob.mismatch))
+			net_dbg_ratelimited("ioam6: no room for the namespace-implied GOB\n");
+
+		return 0;
+	}
 
 	gobsc = rcu_dereference(ns->gob_schema);
 	if (!gobsc)
@@ -505,46 +546,29 @@ __ioam6_fill_gob_trace_data(struct sk_buff *skb, struct ioam6_namespace *ns,
 		 */
 		return 0;
 
-	/* the GOB header sits at the tail of the option */
-	gob = ioam6_trace_gob_hdr_get(hdr);
-	if (unlikely(!gob))
-		goto err;
-
-	/* the IOAM has been check if is writable, e.g., is cloned if
-	 * needed or expanded as well, see@ ipv6_hop_ioam().
-	 * Thus, the GOB header word must be in the linear part of the skb's
-	 * data before we read it, fail otherwise.
-	 */
-	hdr_linear = ioam6_range_is_linear(skb, gob, sizeof(*gob));
-	if (unlikely(!hdr_linear))
-		goto err;
-
-	/* GOB Schema is available, let's retrieve the GOB Schema ID associated
-	 * with this namespace and compare it with the Schema ID carried by the
-	 * GOB Header.
-	 */
-	schema_id = ioam6_trace_gob_schema(gob);
-	schema_match = ioam6_gob_schema_id_eq(schema_id, gobsc->id);
-	if (!schema_match)
-		return 0;
+	if (gob.mode == IOAM6_GOB_MODE_TRAILER) {
+		/* GOB Schema is available, let's retrieve the GOB Schema ID
+		 * associated with this namespace and compare it with the
+		 * Schema ID carried by the GOB trailer.
+		 */
+		schema_id = ioam6_trace_gob_schema(gob.trailer);
+		if (!ioam6_gob_schema_id_eq(schema_id, gobsc->id))
+			return 0;
+	} else {
+		/* namespace-implied GOB: no Schema ID on the wire, the schema
+		 * is the one bound to the namespace.
+		 */
+		schema_id = gobsc->id;
+	}
 
 	/* check if the GOB region size is within the max limits or not */
-	gob_len = ioam6_trace_gob_len(gob);
-	if (unlikely(gob_len > IOAM6_TRACE_GOB_DATA_SIZE_MAX))
+	if (unlikely(gob.len > IOAM6_TRACE_GOB_DATA_SIZE_MAX))
 		goto err;
 
-	/* check whether the *whole* GOB region is in the linear skb's data.
-	 * The payload precedes the header word.
-	 */
-	payload = ioam6_trace_gob_payload(gob);
-	gob_linear = ioam6_range_is_linear(skb, payload, gob_len);
-	if (unlikely(!gob_linear))
-		goto err;
-
-	/* The GOB Header carries the same Schema ID active on the current node
+	/* The GOB is processed with the Schema ID active on the current node
 	 * (due to the binding to the current namespace).
 	 */
-	return ioam6_gob_run_prog(skb, gob, gobsc->bpf.prog);
+	return ioam6_gob_run_prog(skb, &gob, schema_id, gobsc->bpf.prog);
 
 err:
 	/* received weird and/or malformed packet */
@@ -562,12 +586,13 @@ static int
 __bpf_ioam6_gob_common(struct bpf_ioam6_trace_gob_ctx *ctx, u32 offset,
 		       void *usrptr, u32 usrlen, enum bpf_ioam6_gob_op op)
 {
-	const u32 plen = ctx->len - sizeof(struct ioam6_trace_gob_hdr);
+	const u32 plen = ctx->len;
 	void *target;
 
-	/* offset is relative to the GOB payload. The header is not
-	 * addressable here and is never writable. The payload is in the
-	 * linear skb data part, already cloned/expanded if needed.
+	/* offset is relative to the GOB payload and ctx->len is the payload
+	 * length. The GOB trailer, if any, is not addressable here and is
+	 * never writable. The payload is in the linear skb data part, already
+	 * cloned/expanded if needed.
 	 */
 	if (offset + usrlen > plen)
 		/* out of bounds */
@@ -1257,12 +1282,8 @@ static const struct genl_multicast_group ioam6_mcgrps[] = {
 
 static int ioam6_event_put_trace(struct sk_buff *skb,
 				 struct ioam6_trace_hdr *trace,
-				 unsigned int len)
+				 unsigned int len, unsigned int gob_len)
 {
-	struct ioam6_hdr *hdr = ioam6_trace_to_opt(trace);
-	struct ioam6_trace_gob_hdr *gob;
-	int gob_len = 0;
-
 	if (nla_put_u16(skb, IOAM6_EVENT_ATTR_TRACE_NAMESPACE,
 			be16_to_cpu(trace->namespace_id)) ||
 	    nla_put_u8(skb, IOAM6_EVENT_ATTR_TRACE_NODELEN, trace->nodelen) ||
@@ -1270,10 +1291,10 @@ static int ioam6_event_put_trace(struct sk_buff *skb,
 			be32_to_cpu(trace->type_be32)))
 		return 1;
 
-	gob = ioam6_trace_gob_hdr_get(hdr);
-	if (gob)
-		gob_len = ioam6_trace_gob_len(gob);
-
+	/* the GOB (trailer-based or namespace-implied) sits at the tail of
+	 * the option and is not part of the node data: its length comes from
+	 * the caller, who resolved it against the namespace.
+	 */
 	if (nla_put(skb, IOAM6_EVENT_ATTR_TRACE_DATA,
 		    len - sizeof(struct ioam6_trace_hdr) - gob_len -
 		    trace->remlen * 4, trace->data + trace->remlen * 4))
@@ -1283,7 +1304,7 @@ static int ioam6_event_put_trace(struct sk_buff *skb,
 }
 
 void ioam6_event(enum ioam6_event_type type, struct net *net, gfp_t gfp,
-		 void *opt, unsigned int opt_len)
+		 void *opt, unsigned int opt_len, unsigned int gob_len)
 {
 	struct nlmsghdr *nlh;
 	struct sk_buff *skb;
@@ -1306,7 +1327,7 @@ void ioam6_event(enum ioam6_event_type type, struct net *net, gfp_t gfp,
 		break;
 	case IOAM6_EVENT_TRACE:
 		if (ioam6_event_put_trace(skb, (struct ioam6_trace_hdr *)opt,
-					  opt_len))
+					  opt_len, gob_len))
 			goto nla_put_failure;
 		break;
 	}
@@ -1585,6 +1606,8 @@ int ioam6_fill_trace_data(struct sk_buff *skb,
 			  struct ioam6_trace_hdr *trace,
 			  bool is_input)
 {
+	/* RemainingLen as received: the GOB is located against this value */
+	u8 remlen __maybe_unused = trace->remlen;
 	struct ioam6_schema *sc;
 	u8 sclen = 0;
 
@@ -1618,10 +1641,11 @@ int ioam6_fill_trace_data(struct sk_buff *skb,
 
 out:
 #ifdef CONFIG_IPV6_IOAM6_GOB
-	if (ioam6_trace_gob_enabled(trace))
-		return __ioam6_fill_gob_trace_data(skb, ns, trace);
-#endif
+	/* a GOB may be there with the G bit unset (namespace-implied mode) */
+	return __ioam6_fill_gob_trace_data(skb, ns, trace, remlen);
+#else
 	return 0;
+#endif
 }
 
 static int __net_init ioam6_net_init(struct net *net)

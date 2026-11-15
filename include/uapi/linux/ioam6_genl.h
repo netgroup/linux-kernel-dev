@@ -30,6 +30,12 @@ enum {
 	IOAM6_ATTR_GOB_SC_BPF,	/* nested */
 	IOAM6_ATTR_GOB_SC_NONE,	/* Flag */
 
+	/* Namespace-implied GOB: payload size in octets bound to the
+	 * namespace (no GOB trailer on the wire). Absent or 0 means that
+	 * the namespace follows the default, trailer-based mode.
+	 */
+	IOAM6_ATTR_GOB_IMPLIED_LEN,	/* u8 */
+
 	__IOAM6_ATTR_MAX,
 };
 
